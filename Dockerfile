@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# System deps for solc and slither
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
@@ -8,17 +7,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install solc-select and pre-install common versions
-RUN solc-select install 0.8.20 && \
-    solc-select install 0.8.19 && \
-    solc-select install 0.8.17 && \
-    solc-select install 0.8.24 && \
-    solc-select install 0.8.26 && \
-    solc-select use 0.8.20
+# solc versions are installed on-demand at runtime by app.py
+# (avoids GitHub API rate limit during Railway builds)
 
 COPY app.py .
 
