@@ -28,6 +28,7 @@ ETHERSCAN_V2_URL = "https://api.etherscan.io/v2/api"
 NETWORK_CHAIN_IDS = {
     "mainnet":      1,
     "ethereum":     1,
+    "eth":          1,
     "sepolia":      11155111,
     "goerli":       5,
     "bsc":          56,
