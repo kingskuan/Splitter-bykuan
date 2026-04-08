@@ -18,22 +18,35 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 API_KEY = os.environ.get("API_KEY", "")
-ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY", "")
 ANALYSIS_TIMEOUT = int(os.environ.get("ANALYSIS_TIMEOUT", "120"))
 
-# Network -> Etherscan API base URL mapping
-ETHERSCAN_URLS = {
-    "mainnet": "https://api.etherscan.io/api",
-    "ethereum": "https://api.etherscan.io/api",
-    "goerli": "https://api-goerli.etherscan.io/api",
-    "sepolia": "https://api-sepolia.etherscan.io/api",
-    "bsc": "https://api.bscscan.com/api",
-    "bsc-testnet": "https://api-testnet.bscscan.com/api",
-    "polygon": "https://api.polygonscan.com/api",
-    "arbitrum": "https://api.arbiscan.io/api",
-    "optimism": "https://api-optimistic.etherscan.io/api",
-    "base": "https://api.basescan.org/api",
-    "avalanche": "https://api.snowtrace.io/api",
+ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY", "")
+ETHERSCAN_V2_URL = "https://api.etherscan.io/v2/api"
+
+# Etherscan V2 unified API: one key, all chains via chainid parameter
+# https://docs.etherscan.io/etherscan-v2
+NETWORK_CHAIN_IDS = {
+    "mainnet":      1,
+    "ethereum":     1,
+    "sepolia":      11155111,
+    "goerli":       5,
+    "bsc":          56,
+    "bsc-testnet":  97,
+    "polygon":      137,
+    "polygon-zkevm": 1101,
+    "arbitrum":     42161,
+    "arbitrum-nova": 42170,
+    "optimism":     10,
+    "base":         8453,
+    "base-sepolia": 84532,
+    "avalanche":    43114,
+    "fantom":       250,
+    "gnosis":       100,
+    "linea":        59144,
+    "scroll":       534352,
+    "blast":        81457,
+    "mantle":       5000,
+    "zksync":       324,
 }
 
 
@@ -51,24 +64,33 @@ def require_api_key(f):
 
 
 def fetch_source_from_etherscan(address: str, network: str) -> dict:
-    """Fetch contract source code from Etherscan-compatible API."""
-    base_url = ETHERSCAN_URLS.get(network)
-    if not base_url:
-        raise ValueError(f"Unsupported network: {network}. Supported: {list(ETHERSCAN_URLS.keys())}")
+    """Fetch contract source code from Etherscan V2 unified API."""
+    chain_id = NETWORK_CHAIN_IDS.get(network)
+    if not chain_id:
+        raise ValueError(f"Unsupported network: {network}. Supported: {list(NETWORK_CHAIN_IDS.keys())}")
+
+    if not ETHERSCAN_API_KEY:
+        raise ValueError(
+            "Missing ETHERSCAN_API_KEY environment variable. "
+            "Get one free from https://etherscan.io/myapikey (works for all chains via V2 API)."
+        )
 
     params = {
+        "chainid": chain_id,
         "module": "contract",
         "action": "getsourcecode",
         "address": address,
         "apikey": ETHERSCAN_API_KEY,
     }
 
-    resp = http_requests.get(base_url, params=params, timeout=30)
+    resp = http_requests.get(ETHERSCAN_V2_URL, params=params, timeout=30)
     resp.raise_for_status()
     data = resp.json()
 
     if data.get("status") != "1" or not data.get("result"):
-        raise ValueError(f"Etherscan API error: {data.get('message', 'Unknown error')}")
+        msg = data.get("message", "Unknown error")
+        result = data.get("result", "")
+        raise ValueError(f"Etherscan V2 API error for {network} (chainid={chain_id}): {msg} ({result})")
 
     result = data["result"][0]
     source = result.get("SourceCode", "")
@@ -204,6 +226,19 @@ def categorize_findings(slither_output: dict) -> dict:
             categories["low"].append(finding)
 
     return categories
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "service": "slither-analyzer",
+        "status": "running",
+        "endpoints": {
+            "GET /health": "health check",
+            "POST /analyze": "analyze contract (requires X-API-Key header)",
+        },
+        "supported_networks": list(NETWORK_CONFIG.keys()),
+    })
 
 
 @app.route("/health", methods=["GET"])
