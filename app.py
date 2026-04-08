@@ -121,20 +121,31 @@ def extract_solc_version(source_code: str) -> str:
 
 def install_solc_version(version: str):
     """Install and select a specific solc version."""
+    # Check if already installed (pre-baked in Docker image)
+    solc_path = f"/root/.solc-select/artifacts/solc-{version}/solc-{version}"
+    if os.path.exists(solc_path):
+        app.logger.info(f"solc {version} already installed at {solc_path}")
+        try:
+            subprocess.run(["solc-select", "use", version], capture_output=True, timeout=10, check=False)
+        except Exception as e:
+            app.logger.warning(f"solc-select use {version} failed: {e}")
+        return
+
+    app.logger.info(f"solc {version} not pre-installed, attempting download...")
     try:
         result = subprocess.run(
             ["solc-select", "install", version],
             capture_output=True, text=True, timeout=120, check=False
         )
+        app.logger.info(f"solc-select install {version}: exit={result.returncode}, stdout={result.stdout[:200]}, stderr={result.stderr[:200]}")
         if result.returncode != 0 and "already installed" not in (result.stdout + result.stderr):
-            app.logger.warning(f"solc-select install {version} failed: {result.stderr}")
-            return  # Keep whatever version was active
-        subprocess.run(
-            ["solc-select", "use", version],
-            capture_output=True, timeout=10, check=False
-        )
+            app.logger.warning(f"solc-select install {version} failed, falling back to 0.8.20")
+            subprocess.run(["solc-select", "use", "0.8.20"], capture_output=True, timeout=10, check=False)
+            return
+        subprocess.run(["solc-select", "use", version], capture_output=True, timeout=10, check=False)
     except Exception as e:
-        app.logger.warning(f"Failed to install solc {version}: {e}, using current default")
+        app.logger.warning(f"Failed to install solc {version}: {e}, falling back to 0.8.20")
+        subprocess.run(["solc-select", "use", "0.8.20"], capture_output=True, timeout=10, check=False)
 
 
 def prepare_source_files(work_dir: str, source_code: str, contract_name: str) -> str:
@@ -169,12 +180,20 @@ def prepare_source_files(work_dir: str, source_code: str, contract_name: str) ->
 
 def run_slither(target: str, work_dir: str) -> dict:
     """Run Slither analysis and return parsed results."""
+    # Diagnostic: which solc is active
+    try:
+        ver = subprocess.run(["solc", "--version"], capture_output=True, text=True, timeout=5)
+        app.logger.info(f"Active solc: {ver.stdout[:200]}")
+    except Exception as e:
+        app.logger.warning(f"Cannot get solc version: {e}")
+
     cmd = [
         "slither", target,
         "--json", "-",
         "--exclude-informational",
         "--exclude-optimization",
     ]
+    app.logger.info(f"Running: {' '.join(cmd)} (cwd={work_dir})")
 
     result = subprocess.run(
         cmd,
