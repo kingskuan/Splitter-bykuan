@@ -185,16 +185,28 @@ def run_slither(target: str, work_dir: str) -> dict:
         env=os.environ.copy(),
     )
 
-    # Slither outputs JSON to stdout even on non-zero exit (findings = exit 1)
     output = result.stdout.strip()
-    if not output:
-        # Try stderr for error messages
-        error = result.stderr.strip()
-        if error:
-            raise RuntimeError(f"Slither analysis failed: {error[:500]}")
-        raise RuntimeError("Slither returned no output")
+    stderr = result.stderr.strip()
 
-    return json.loads(output)
+    # Log for debugging
+    app.logger.info(f"Slither exit={result.returncode}, stdout={len(output)}b, stderr={len(stderr)}b")
+    if stderr:
+        app.logger.info(f"Slither stderr: {stderr[:1000]}")
+
+    # Slither outputs JSON to stdout even on non-zero exit (findings = exit 1/255)
+    if not output:
+        # Try to surface the real error from stderr
+        if stderr:
+            # Extract most relevant error line
+            err_lines = [l for l in stderr.split("\n") if l.strip() and not l.startswith("Warning")]
+            err_msg = " | ".join(err_lines[-3:]) if err_lines else stderr[:500]
+            raise RuntimeError(f"Slither failed (exit {result.returncode}): {err_msg[:800]}")
+        raise RuntimeError(f"Slither returned no output (exit {result.returncode}). No stderr either — possible OOM or timeout.")
+
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Slither output not valid JSON: {output[:300]}... stderr: {stderr[:300]}")
 
 
 def categorize_findings(slither_output: dict) -> dict:
