@@ -229,6 +229,148 @@ def run_slither(target: str, work_dir: str) -> dict:
         raise RuntimeError(f"Slither output not valid JSON: {output[:300]}... stderr: {stderr[:300]}")
 
 
+def extract_centralization_risks(source_code: str) -> dict:
+    """Scan Solidity source for centralization/trust risks that Slither misses.
+
+    Returns structured risk info + raw code excerpts of dangerous functions.
+    """
+    risks = {
+        "can_mint": False,
+        "mint_details": [],
+        "can_burn_others": False,
+        "can_pause": False,
+        "has_blacklist": False,
+        "has_whitelist": False,
+        "has_fees": False,
+        "fee_changeable": False,
+        "is_upgradeable": False,
+        "can_transfer_ownership": False,
+        "can_rescue_tokens": False,
+        "has_trading_control": False,
+        "has_max_tx_limit": False,
+        "has_anti_whale": False,
+        "owner_only_functions": [],
+        "role_based_functions": [],
+        "dangerous_excerpts": [],
+    }
+
+    # Normalize: strip comments for pattern matching but keep original for excerpts
+    code_no_comments = re.sub(r"//.*?$|/\*.*?\*/", "", source_code, flags=re.MULTILINE | re.DOTALL)
+
+    # 1. MINTING — look for functions that add to totalSupply/balances
+    mint_pattern = re.compile(
+        r"function\s+(\w*[Mm]int\w*)\s*\([^)]*\)[^{]*\{[^}]*(?:_totalSupply\s*\+=|totalSupply\s*\+=|_balances\[[^\]]+\]\s*\+=|_mint\s*\(|balances\[[^\]]+\]\s*\+=)",
+        re.DOTALL
+    )
+    for m in mint_pattern.finditer(code_no_comments):
+        risks["can_mint"] = True
+        fn_name = m.group(1)
+        # Check if there's a cap/limit
+        snippet = m.group(0)[:500]
+        has_cap = bool(re.search(r"require\s*\([^)]*(?:cap|MAX_SUPPLY|maxSupply|_cap)[^)]*\)", snippet, re.I))
+        risks["mint_details"].append({
+            "function": fn_name,
+            "has_cap": has_cap,
+            "snippet": snippet[:300],
+        })
+
+    # Also check for _mint internal calls exposed via public function
+    if not risks["can_mint"]:
+        if re.search(r"function\s+\w+[^{]*\bpublic\b[^{]*\{[^}]*\b_mint\s*\(", code_no_comments, re.DOTALL):
+            risks["can_mint"] = True
+            risks["mint_details"].append({"function": "exposes_mint", "has_cap": False, "snippet": ""})
+
+    # 2. BURN others' tokens
+    if re.search(r"function\s+\w*[Bb]urn\w*\s*\(\s*address\s+\w+", code_no_comments):
+        risks["can_burn_others"] = True
+
+    # 3. PAUSABLE
+    if re.search(r"\b(Pausable|_pause\s*\(|whenNotPaused|_paused\s*=\s*true)", code_no_comments):
+        risks["can_pause"] = True
+
+    # 4. BLACKLIST
+    blacklist_patterns = [
+        r"mapping\s*\([^)]*\)\s*(?:public\s+)?(?:_?[Bb]lacklist|_?[Bb]lackList|_?isBlocked|_?banned|_?frozen)",
+        r"function\s+\w*[Bb]lacklist\w*\s*\(",
+        r"function\s+\w*[Bb]lock\w*\s*\(\s*address",
+        r"function\s+\w*[Ff]reeze\w*\s*\(\s*address",
+    ]
+    if any(re.search(p, code_no_comments) for p in blacklist_patterns):
+        risks["has_blacklist"] = True
+
+    # 5. WHITELIST
+    if re.search(r"mapping\s*\([^)]*\)\s*(?:public\s+)?_?[Ww]hitelist|function\s+\w*[Ww]hitelist\w*\s*\(", code_no_comments):
+        risks["has_whitelist"] = True
+
+    # 6. FEES / TAXES
+    fee_state = re.search(r"(uint\d*\s+(?:public\s+)?(?:_?fee|_?tax|buyFee|sellFee|buyTax|sellTax|marketingFee|liquidityFee)\w*)", code_no_comments, re.I)
+    if fee_state:
+        risks["has_fees"] = True
+        # Check if setter exists
+        if re.search(r"function\s+\w*[Ss]et\w*(?:[Ff]ee|[Tt]ax)\w*\s*\(", code_no_comments):
+            risks["fee_changeable"] = True
+
+    # 7. UPGRADEABLE (proxy patterns)
+    if re.search(r"(UUPSUpgradeable|TransparentUpgradeableProxy|Initializable|_authorizeUpgrade|upgradeTo\s*\(|upgradeToAndCall)", code_no_comments):
+        risks["is_upgradeable"] = True
+
+    # 8. OWNERSHIP TRANSFER
+    if re.search(r"function\s+transferOwnership\s*\(|Ownable", code_no_comments):
+        risks["can_transfer_ownership"] = True
+
+    # 9. RESCUE / WITHDRAW stuck tokens (can be legit, can be rug)
+    if re.search(r"function\s+\w*(?:[Rr]escue|[Ww]ithdraw(?:Token|Stuck|Any|ERC20)|[Ss]weep|[Rr]etrieve)\w*\s*\(", code_no_comments):
+        risks["can_rescue_tokens"] = True
+
+    # 10. TRADING ENABLE/DISABLE (honeypot pattern)
+    if re.search(r"(tradingEnabled|tradingActive|launched|tradingOpen|swapEnabled)\s*(?:=|\?)", code_no_comments):
+        risks["has_trading_control"] = True
+
+    # 11. MAX TX / MAX WALLET
+    if re.search(r"(maxTx|maxTransaction|maxWallet|maxHolding)", code_no_comments, re.I):
+        risks["has_max_tx_limit"] = True
+        risks["has_anti_whale"] = True
+
+    # 12. Extract all onlyOwner / onlyRole functions (up to 20)
+    owner_fn_pattern = re.compile(
+        r"function\s+(\w+)\s*\([^)]*\)[^{]*?\b(onlyOwner|onlyAdmin|onlyGovernance|onlyOperator)\b",
+        re.DOTALL
+    )
+    seen_fns = set()
+    for m in owner_fn_pattern.finditer(code_no_comments):
+        fn = m.group(1)
+        if fn not in seen_fns and len(seen_fns) < 20:
+            seen_fns.add(fn)
+            risks["owner_only_functions"].append(fn)
+
+    # 13. Role-based (AccessControl)
+    role_fn_pattern = re.compile(
+        r"function\s+(\w+)\s*\([^)]*\)[^{]*?onlyRole\s*\(\s*(\w+)\s*\)",
+        re.DOTALL
+    )
+    seen_roles = set()
+    for m in role_fn_pattern.finditer(code_no_comments):
+        fn, role = m.group(1), m.group(2)
+        key = f"{fn}:{role}"
+        if key not in seen_roles and len(seen_roles) < 20:
+            seen_roles.add(key)
+            risks["role_based_functions"].append({"function": fn, "role": role})
+
+    # 14. Extract dangerous function bodies as excerpts (for LLM review)
+    dangerous_keywords = ["mint", "blacklist", "setFee", "setTax", "pause", "rescue", "withdrawToken", "setTrading", "excludeFrom", "_authorizeUpgrade"]
+    for kw in dangerous_keywords:
+        pattern = re.compile(
+            rf"function\s+\w*{kw}\w*\s*\([^)]*\)[^{{]*\{{[^}}]{{0,400}}\}}",
+            re.IGNORECASE | re.DOTALL
+        )
+        for m in pattern.finditer(code_no_comments):
+            excerpt = m.group(0)[:600].strip()
+            if excerpt and len(risks["dangerous_excerpts"]) < 15:
+                risks["dangerous_excerpts"].append(excerpt)
+
+    return risks
+
+
 def categorize_findings(slither_output: dict) -> dict:
     """Extract and categorize findings by impact level."""
     categories = {"critical": [], "high": [], "medium": [], "low": []}
@@ -326,6 +468,9 @@ def analyze():
         # Step 3: Write source files
         target = prepare_source_files(work_dir, source_code, contract_name)
 
+        # Step 3.5: Extract centralization/trust risks via regex (fast, no LLM)
+        centralization_risks = extract_centralization_risks(source_code)
+
         # Step 4: Run Slither
         slither_output = run_slither(target, work_dir)
 
@@ -335,14 +480,24 @@ def analyze():
         duration_ms = int((time.time() - start_time) * 1000)
 
         total = sum(len(v) for v in findings.values())
+
+        # Count centralization red flags
+        central_flags = sum([
+            centralization_risks["can_mint"],
+            centralization_risks["can_burn_others"],
+            centralization_risks["can_pause"],
+            centralization_risks["has_blacklist"],
+            centralization_risks["fee_changeable"],
+            centralization_risks["is_upgradeable"],
+            centralization_risks["has_trading_control"],
+            centralization_risks["can_rescue_tokens"],
+        ])
+
         summary = (
-            f"Found {total} issue(s): "
-            f"{len(findings['critical'])} critical, "
-            f"{len(findings['high'])} high, "
-            f"{len(findings['medium'])} medium, "
-            f"{len(findings['low'])} low. "
-            f"Solc version: {solc_version}. "
-            f"Analysis took {duration_ms}ms."
+            f"Slither: {total} code issue(s) "
+            f"({len(findings['critical'])}C/{len(findings['high'])}H/{len(findings['medium'])}M/{len(findings['low'])}L). "
+            f"Centralization: {central_flags} trust risk(s) detected. "
+            f"Solc {solc_version}, {duration_ms}ms."
         )
 
         return jsonify({
@@ -352,6 +507,7 @@ def analyze():
             "network": network,
             "solc_version": solc_version,
             "findings": findings,
+            "centralization_risks": centralization_risks,
             "summary": summary,
             "duration_ms": duration_ms,
         })
