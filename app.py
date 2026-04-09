@@ -120,33 +120,54 @@ def extract_solc_version(source_code: str) -> str:
     return "0.8.20"  # Default fallback
 
 
-def install_solc_version(version: str):
-    """Install and select a specific solc version."""
-    # Check if already installed (pre-baked in Docker image)
-    solc_path = f"/root/.solc-select/artifacts/solc-{version}/solc-{version}"
-    if os.path.exists(solc_path):
-        app.logger.info(f"solc {version} already installed at {solc_path}")
-        try:
-            subprocess.run(["solc-select", "use", version], capture_output=True, timeout=10, check=False)
-        except Exception as e:
-            app.logger.warning(f"solc-select use {version} failed: {e}")
-        return
+_VERSION_RE = re.compile(r"^0\.\d{1,2}\.\d{1,2}$")
+_SOLC_ARTIFACTS_DIR = "/root/.solc-select/artifacts"
+_DEFAULT_SOLC = "0.8.20"
 
-    app.logger.info(f"solc {version} not pre-installed, attempting download...")
+
+def validate_solc_version(version: str) -> str:
+    """Whitelist validate version string. Returns safe version or default."""
+    if not version or not _VERSION_RE.match(version):
+        return _DEFAULT_SOLC
+    return version
+
+
+def resolve_solc_binary(version: str) -> str:
+    """Return absolute path to solc binary for given version.
+
+    Avoids the global-state race condition from `solc-select use`:
+    instead of mutating a shared pointer, we pass --solc <path> directly
+    to Slither. Pre-installed versions are in the Docker image.
+
+    Falls back to on-demand download via solc-select (still mutates global
+    state but only once per missing version; subsequent calls use the path).
+    """
+    version = validate_solc_version(version)
+    binary_path = os.path.join(_SOLC_ARTIFACTS_DIR, f"solc-{version}", f"solc-{version}")
+
+    if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
+        return binary_path
+
+    # Not pre-installed — try to download. Use solc-select as a last resort.
+    # This path mutates global state briefly, but we still return the binary
+    # path afterwards so concurrent requests for different versions don't
+    # collide during actual Slither execution.
+    app.logger.info(f"solc {version} not pre-installed, downloading via solc-select")
     try:
         result = subprocess.run(
             ["solc-select", "install", version],
             capture_output=True, text=True, timeout=120, check=False
         )
-        app.logger.info(f"solc-select install {version}: exit={result.returncode}, stdout={result.stdout[:200]}, stderr={result.stderr[:200]}")
-        if result.returncode != 0 and "already installed" not in (result.stdout + result.stderr):
-            app.logger.warning(f"solc-select install {version} failed, falling back to 0.8.20")
-            subprocess.run(["solc-select", "use", "0.8.20"], capture_output=True, timeout=10, check=False)
-            return
-        subprocess.run(["solc-select", "use", version], capture_output=True, timeout=10, check=False)
+        app.logger.info(f"solc-select install {version}: exit={result.returncode}")
+        if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
+            return binary_path
     except Exception as e:
-        app.logger.warning(f"Failed to install solc {version}: {e}, falling back to 0.8.20")
-        subprocess.run(["solc-select", "use", "0.8.20"], capture_output=True, timeout=10, check=False)
+        app.logger.warning(f"Failed to install solc {version}: {e}")
+
+    # Final fallback: default version (must be pre-installed)
+    default_path = os.path.join(_SOLC_ARTIFACTS_DIR, f"solc-{_DEFAULT_SOLC}", f"solc-{_DEFAULT_SOLC}")
+    app.logger.warning(f"Falling back to {_DEFAULT_SOLC} at {default_path}")
+    return default_path
 
 
 def prepare_source_files(work_dir: str, source_code: str, contract_name: str) -> str:
@@ -179,22 +200,23 @@ def prepare_source_files(work_dir: str, source_code: str, contract_name: str) ->
     return filepath
 
 
-def run_slither(target: str, work_dir: str) -> dict:
-    """Run Slither analysis and return parsed results."""
-    # Diagnostic: which solc is active
+def run_slither(target: str, work_dir: str, solc_path: str) -> dict:
+    """Run Slither analysis with explicit solc binary (no global state)."""
+    # Diagnostic: check solc binary
     try:
-        ver = subprocess.run(["solc", "--version"], capture_output=True, text=True, timeout=5)
-        app.logger.info(f"Active solc: {ver.stdout[:200]}")
+        ver = subprocess.run([solc_path, "--version"], capture_output=True, text=True, timeout=5)
+        app.logger.info(f"Using solc at {solc_path}: {ver.stdout[:150]}")
     except Exception as e:
-        app.logger.warning(f"Cannot get solc version: {e}")
+        app.logger.warning(f"Cannot invoke solc at {solc_path}: {e}")
 
     cmd = [
         "slither", target,
+        "--solc", solc_path,
         "--json", "-",
         "--exclude-informational",
         "--exclude-optimization",
     ]
-    app.logger.info(f"Running: {' '.join(cmd)} (cwd={work_dir})")
+    app.logger.info(f"Running: slither {target} --solc {solc_path} (cwd={work_dir})")
 
     result = subprocess.run(
         cmd,
@@ -254,8 +276,13 @@ def extract_centralization_risks(source_code: str) -> dict:
         "dangerous_excerpts": [],
     }
 
-    # Normalize: strip comments for pattern matching but keep original for excerpts
-    code_no_comments = re.sub(r"//.*?$|/\*.*?\*/", "", source_code, flags=re.MULTILINE | re.DOTALL)
+    # Normalize: strip comments AND string literals to avoid false positives
+    # (e.g. require(x, "You cannot mint tokens") shouldn't trigger mint detection)
+    code_clean = re.sub(r"//.*?$|/\*.*?\*/", "", source_code, flags=re.MULTILINE | re.DOTALL)
+    # Remove double-quoted and single-quoted string literals (handle escaped quotes)
+    code_clean = re.sub(r'"(?:[^"\\]|\\.)*"', '""', code_clean)
+    code_clean = re.sub(r"'(?:[^'\\]|\\.)*'", "''", code_clean)
+    code_no_comments = code_clean  # keep variable name for rest of function
 
     # 1. MINTING — look for functions that add to totalSupply/balances
     mint_pattern = re.compile(
@@ -415,6 +442,16 @@ def index():
     })
 
 
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "service": "slither-analyzer",
+        "status": "ok",
+        "endpoints": ["/health", "/analyze"],
+        "supported_networks": list(NETWORK_CHAIN_IDS.keys()),
+    })
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "slither-analyzer"})
@@ -455,15 +492,16 @@ def analyze():
         if not contract_name:
             contract_name = "Contract"
 
-        # Step 2: Detect and install correct solc version
+        # Step 2: Detect solc version (whitelist validated)
         solc_version = extract_solc_version(source_code)
         if compiler_version:
-            # Extract version number from compiler string like "v0.8.20+commit.xxx"
             ver_match = re.search(r"(0\.\d+\.\d+)", compiler_version)
             if ver_match:
                 solc_version = ver_match.group(1)
+        solc_version = validate_solc_version(solc_version)
 
-        install_solc_version(solc_version)
+        # Resolve binary path (no global state mutation)
+        solc_path = resolve_solc_binary(solc_version)
 
         # Step 3: Write source files
         target = prepare_source_files(work_dir, source_code, contract_name)
@@ -471,8 +509,8 @@ def analyze():
         # Step 3.5: Extract centralization/trust risks via regex (fast, no LLM)
         centralization_risks = extract_centralization_risks(source_code)
 
-        # Step 4: Run Slither
-        slither_output = run_slither(target, work_dir)
+        # Step 4: Run Slither with explicit solc binary
+        slither_output = run_slither(target, work_dir, solc_path)
 
         # Step 5: Categorize findings
         findings = categorize_findings(slither_output)
