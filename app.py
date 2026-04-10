@@ -433,19 +433,6 @@ def categorize_findings(slither_output: dict) -> dict:
 def index():
     return jsonify({
         "service": "slither-analyzer",
-        "status": "running",
-        "endpoints": {
-            "GET /health": "health check",
-            "POST /analyze": "analyze contract (requires X-API-Key header)",
-        },
-        "supported_networks": list(NETWORK_CONFIG.keys()),
-    })
-
-
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({
-        "service": "slither-analyzer",
         "status": "ok",
         "endpoints": ["/health", "/analyze"],
         "supported_networks": list(NETWORK_CHAIN_IDS.keys()),
