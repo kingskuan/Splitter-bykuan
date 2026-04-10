@@ -251,6 +251,122 @@ def run_slither(target: str, work_dir: str, solc_path: str) -> dict:
         raise RuntimeError(f"Slither output not valid JSON: {output[:300]}... stderr: {stderr[:300]}")
 
 
+def fetch_external_risks(address: str, network: str) -> dict:
+    """Fetch off-chain & live-state risks via GoPlus Security API (free, no key).
+
+    Returns holder concentration, LP lock status, tax, honeypot detection, etc.
+    https://docs.gopluslabs.io/reference/api-overview
+    """
+    chain_id = NETWORK_CHAIN_IDS.get(network)
+    if not chain_id:
+        return {"available": False, "reason": f"Network {network} not supported"}
+
+    try:
+        url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
+        resp = http_requests.get(
+            url,
+            params={"contract_addresses": address.lower()},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("code") != 1:
+            return {"available": False, "reason": data.get("message", "GoPlus error")}
+
+        result = (data.get("result") or {}).get(address.lower())
+        if not result:
+            return {"available": False, "reason": "Token not found in GoPlus database"}
+
+        # Extract fields (GoPlus uses string "0"/"1" instead of bool)
+        def flag(key, default=None):
+            v = result.get(key)
+            if v == "1": return True
+            if v == "0": return False
+            return default
+
+        def num(key, default=0.0):
+            try: return float(result.get(key, default))
+            except (ValueError, TypeError): return default
+
+        # Top holder concentration
+        holders = result.get("holders") or []
+        top10_pct = sum(num_or_zero(h.get("percent", 0)) for h in holders[:10]) * 100
+
+        # LP lock status
+        lp_holders = result.get("lp_holders") or []
+        lp_locked_pct = sum(
+            num_or_zero(lp.get("percent", 0)) * 100
+            for lp in lp_holders
+            if lp.get("is_locked") == 1 or "lock" in str(lp.get("tag", "")).lower() or lp.get("address", "").lower() in ("0x000000000000000000000000000000000000dead", "0x0000000000000000000000000000000000000000")
+        )
+
+        return {
+            "available": True,
+            "source": "GoPlus Security",
+            # Honeypot & trading
+            "is_honeypot": flag("is_honeypot"),
+            "cannot_buy": flag("cannot_buy"),
+            "cannot_sell_all": flag("cannot_sell_all"),
+            "trading_cooldown": flag("trading_cooldown"),
+            "transfer_pausable": flag("transfer_pausable"),
+            # Tax
+            "buy_tax_pct": round(num("buy_tax") * 100, 2),
+            "sell_tax_pct": round(num("sell_tax") * 100, 2),
+            # Permissions (live state)
+            "is_mintable": flag("is_mintable"),
+            "owner_can_change_balance": flag("owner_change_balance"),
+            "hidden_owner": flag("hidden_owner"),
+            "can_take_back_ownership": flag("can_take_back_ownership"),
+            "self_destruct": flag("selfdestruct"),
+            "external_call_risk": flag("external_call"),
+            # Lists
+            "is_blacklisted": flag("is_blacklisted"),
+            "is_whitelisted": flag("is_whitelisted"),
+            # Anti-whale
+            "is_anti_whale": flag("is_anti_whale"),
+            "anti_whale_modifiable": flag("anti_whale_modifiable"),
+            # Proxy / upgrade
+            "is_proxy": flag("is_proxy"),
+            # Source
+            "is_open_source": flag("is_open_source"),
+            # Holder distribution
+            "holder_count": int(num("holder_count")),
+            "top10_holders_pct": round(top10_pct, 2),
+            "top_holders": [
+                {
+                    "address": h.get("address", "")[:10] + "...",
+                    "percent": round(num_or_zero(h.get("percent", 0)) * 100, 2),
+                    "is_contract": h.get("is_contract") == 1,
+                    "tag": h.get("tag", ""),
+                }
+                for h in holders[:5]
+            ],
+            # Owner / creator
+            "owner_address": result.get("owner_address", ""),
+            "owner_balance_pct": round(num("owner_percent") * 100, 2),
+            "creator_address": result.get("creator_address", ""),
+            "creator_balance_pct": round(num("creator_percent") * 100, 2),
+            # LP
+            "lp_holder_count": len(lp_holders),
+            "lp_locked_or_burned_pct": round(lp_locked_pct, 2),
+            # Token info
+            "token_name": result.get("token_name", ""),
+            "token_symbol": result.get("token_symbol", ""),
+            "total_supply": result.get("total_supply", ""),
+        }
+    except Exception as e:
+        app.logger.warning(f"GoPlus fetch failed: {e}")
+        return {"available": False, "reason": str(e)[:200]}
+
+
+def num_or_zero(v):
+    try:
+        return float(v) if v else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def extract_centralization_risks(source_code: str) -> dict:
     """Scan Solidity source for centralization/trust risks that Slither misses.
 
@@ -274,17 +390,39 @@ def extract_centralization_risks(source_code: str) -> dict:
         "owner_only_functions": [],
         "role_based_functions": [],
         "dangerous_excerpts": [],
+        "inherits_minter": False,
     }
 
-    # Normalize: strip comments AND string literals to avoid false positives
-    # (e.g. require(x, "You cannot mint tokens") shouldn't trigger mint detection)
-    code_clean = re.sub(r"//.*?$|/\*.*?\*/", "", source_code, flags=re.MULTILINE | re.DOTALL)
-    # Remove double-quoted and single-quoted string literals (handle escaped quotes)
+    # CRITICAL: Etherscan multi-file format returns JSON where newlines are
+    # literal `\n` (two chars). Regex with `\s` won't match across them.
+    # Detect and unwrap to real Solidity text.
+    real_source = source_code
+    stripped = source_code.strip()
+    if stripped.startswith("{") and ('"content"' in stripped or '"sources"' in stripped):
+        try:
+            parsed = json.loads(stripped)
+            sources = parsed.get("sources", parsed) if isinstance(parsed, dict) else {}
+            collected = []
+            if isinstance(sources, dict):
+                for filename, file_data in sources.items():
+                    if isinstance(file_data, dict) and "content" in file_data:
+                        collected.append(file_data["content"])
+                    elif isinstance(file_data, str):
+                        collected.append(file_data)
+            if collected:
+                real_source = "\n\n".join(collected)
+                app.logger.info(f"Unpacked multi-file source: {len(collected)} files, {len(real_source)} chars total")
+        except (json.JSONDecodeError, AttributeError) as e:
+            app.logger.warning(f"Multi-file source parse failed, using raw: {e}")
+
+    # Strip comments AND string literals to avoid false positives
+    code_clean = re.sub(r"//.*?$|/\*.*?\*/", "", real_source, flags=re.MULTILINE | re.DOTALL)
     code_clean = re.sub(r'"(?:[^"\\]|\\.)*"', '""', code_clean)
     code_clean = re.sub(r"'(?:[^'\\]|\\.)*'", "''", code_clean)
-    code_no_comments = code_clean  # keep variable name for rest of function
+    code_no_comments = code_clean
 
-    # 1. MINTING — look for functions that add to totalSupply/balances
+    # 1. MINTING — multiple detection strategies
+    # Strategy A: function explicitly named *mint* with body adding to supply
     mint_pattern = re.compile(
         r"function\s+(\w*[Mm]int\w*)\s*\([^)]*\)[^{]*\{[^}]*(?:_totalSupply\s*\+=|totalSupply\s*\+=|_balances\[[^\]]+\]\s*\+=|_mint\s*\(|balances\[[^\]]+\]\s*\+=)",
         re.DOTALL
@@ -292,20 +430,50 @@ def extract_centralization_risks(source_code: str) -> dict:
     for m in mint_pattern.finditer(code_no_comments):
         risks["can_mint"] = True
         fn_name = m.group(1)
-        # Check if there's a cap/limit
         snippet = m.group(0)[:500]
-        has_cap = bool(re.search(r"require\s*\([^)]*(?:cap|MAX_SUPPLY|maxSupply|_cap)[^)]*\)", snippet, re.I))
+        has_cap = bool(re.search(r"require\s*\([^)]*(?:cap|MAX_SUPPLY|maxSupply|_cap|TOTAL_SUPPLY)[^)]*\)", snippet, re.I))
         risks["mint_details"].append({
             "function": fn_name,
             "has_cap": has_cap,
             "snippet": snippet[:300],
         })
 
-    # Also check for _mint internal calls exposed via public function
-    if not risks["can_mint"]:
-        if re.search(r"function\s+\w+[^{]*\bpublic\b[^{]*\{[^}]*\b_mint\s*\(", code_no_comments, re.DOTALL):
+    # Strategy B: ANY function that calls _mint( (catches custom function names like "release", "issue", "distribute")
+    # This is the catch-all that fixes UXLINK-style misses
+    any_fn_with_mint = re.compile(
+        r"function\s+(\w+)\s*\([^)]*\)[^{]*\{(?:[^{}]|\{[^{}]*\})*?\b_mint\s*\(",
+        re.DOTALL
+    )
+    for m in any_fn_with_mint.finditer(code_no_comments):
+        fn_name = m.group(1)
+        # Skip OZ internal helpers and constructors
+        if fn_name in ("_mint", "_beforeTokenTransfer", "_afterTokenTransfer", "_update"):
+            continue
+        if not any(d.get("function") == fn_name for d in risks["mint_details"]):
             risks["can_mint"] = True
-            risks["mint_details"].append({"function": "exposes_mint", "has_cap": False, "snippet": ""})
+            risks["mint_details"].append({
+                "function": fn_name,
+                "has_cap": False,
+                "snippet": m.group(0)[:300],
+            })
+
+    # Strategy C: Inherits from known mintable parent contracts
+    inherit_patterns = [
+        r"\bcontract\s+\w+\s+is\s+[^{]*\b(ERC20PresetMinterPauser|ERC20Mintable|MintableToken|ERC20Capped)\b",
+        r"\bMINTER_ROLE\b",
+        r"\bMINTER\b\s*=\s*keccak256",
+    ]
+    for p in inherit_patterns:
+        if re.search(p, code_no_comments):
+            risks["can_mint"] = True
+            risks["inherits_minter"] = True
+            if not risks["mint_details"]:
+                risks["mint_details"].append({
+                    "function": "inherited_or_role_based",
+                    "has_cap": False,
+                    "snippet": "Mint capability via inheritance or MINTER_ROLE — review parent contracts",
+                })
+            break
 
     # 2. BURN others' tokens
     if re.search(r"function\s+\w*[Bb]urn\w*\s*\(\s*address\s+\w+", code_no_comments):
@@ -496,6 +664,11 @@ def analyze():
         # Step 3.5: Extract centralization/trust risks via regex (fast, no LLM)
         centralization_risks = extract_centralization_risks(source_code)
 
+        # Step 3.6: Fetch external/live-state risks via GoPlus (only if we have an address)
+        external_risks = {"available": False, "reason": "no address provided"}
+        if address:
+            external_risks = fetch_external_risks(address, network)
+
         # Step 4: Run Slither with explicit solc binary
         slither_output = run_slither(target, work_dir, solc_path)
 
@@ -506,22 +679,31 @@ def analyze():
 
         total = sum(len(v) for v in findings.values())
 
-        # Count centralization red flags
+        # Count centralization red flags (combines static + live state from GoPlus)
+        ext = external_risks if external_risks.get("available") else {}
         central_flags = sum([
-            centralization_risks["can_mint"],
+            centralization_risks["can_mint"] or ext.get("is_mintable") is True,
             centralization_risks["can_burn_others"],
-            centralization_risks["can_pause"],
-            centralization_risks["has_blacklist"],
+            centralization_risks["can_pause"] or ext.get("transfer_pausable") is True,
+            centralization_risks["has_blacklist"] or ext.get("is_blacklisted") is True,
             centralization_risks["fee_changeable"],
-            centralization_risks["is_upgradeable"],
+            centralization_risks["is_upgradeable"] or ext.get("is_proxy") is True,
             centralization_risks["has_trading_control"],
             centralization_risks["can_rescue_tokens"],
+            ext.get("is_honeypot") is True,
+            ext.get("hidden_owner") is True,
+            ext.get("can_take_back_ownership") is True,
+            ext.get("owner_can_change_balance") is True,
+            ext.get("self_destruct") is True,
+            (ext.get("buy_tax_pct", 0) >= 10) or (ext.get("sell_tax_pct", 0) >= 10),
+            (ext.get("top10_holders_pct", 0) >= 70),
+            (ext.get("lp_locked_or_burned_pct", 100) < 50),
         ])
 
         summary = (
             f"Slither: {total} code issue(s) "
             f"({len(findings['critical'])}C/{len(findings['high'])}H/{len(findings['medium'])}M/{len(findings['low'])}L). "
-            f"Centralization: {central_flags} trust risk(s) detected. "
+            f"Trust risks: {central_flags} red flag(s). "
             f"Solc {solc_version}, {duration_ms}ms."
         )
 
@@ -533,6 +715,7 @@ def analyze():
             "solc_version": solc_version,
             "findings": findings,
             "centralization_risks": centralization_risks,
+            "external_risks": external_risks,
             "summary": summary,
             "duration_ms": duration_ms,
         })
