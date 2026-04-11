@@ -808,6 +808,18 @@ def health():
     return jsonify({"status": "ok", "service": "slither-analyzer"})
 
 
+@app.route("/debug", methods=["GET"])
+def debug():
+    """Diagnostic endpoint - check config without exposing secrets."""
+    return jsonify({
+        "enrichment_enabled": ENRICHMENT_ENABLED,
+        "etherscan_key_set": bool(ETHERSCAN_API_KEY),
+        "etherscan_key_length": len(ETHERSCAN_API_KEY) if ETHERSCAN_API_KEY else 0,
+        "api_key_set": bool(API_KEY),
+        "supported_networks": list(NETWORK_CHAIN_IDS.keys()),
+    })
+
+
 @app.route("/analyze", methods=["POST"])
 @require_api_key
 def analyze():
@@ -910,15 +922,21 @@ def analyze():
 
         # ── On-chain enrichment: fetch live data to eliminate "please verify manually" ──
         enriched = None
+        app.logger.warning(f"[ENRICH-DEBUG] enabled={ENRICHMENT_ENABLED} address={bool(address)} network={network} key_set={bool(ETHERSCAN_API_KEY)}")
         if ENRICHMENT_ENABLED and address:
             chain_id = NETWORK_CHAIN_IDS.get(network)
+            app.logger.warning(f"[ENRICH-DEBUG] chain_id={chain_id}")
             if chain_id and ETHERSCAN_API_KEY:
                 try:
                     enriched = enrich_contract(address, chain_id, ETHERSCAN_API_KEY)
-                    app.logger.info(f"Enrichment complete for {address}: {len(enriched.get('risk_flags', []))} flags")
+                    app.logger.warning(f"[ENRICH-OK] flags={enriched.get('risk_flags', [])} roles={list(enriched.get('privileged_roles', {}).keys())}")
                 except Exception as e:
-                    app.logger.warning(f"Enrichment failed: {e}")
+                    app.logger.warning(f"[ENRICH-FAIL] {type(e).__name__}: {e}")
                     enriched = {"error": str(e)[:200]}
+            else:
+                app.logger.warning(f"[ENRICH-SKIP] chain_id={chain_id} key={bool(ETHERSCAN_API_KEY)}")
+        else:
+            app.logger.warning(f"[ENRICH-SKIP] enabled={ENRICHMENT_ENABLED} has_address={bool(address)}")
 
         return jsonify({
             "status": "ok",
