@@ -182,25 +182,63 @@ def _decode_uint(hex_result: str) -> Optional[int]:
         return None
 
 
-def _get_owner_or_manager(chain_id: int, address: str, api_key: str) -> dict:
-    """Try common privileged-role getters: owner(), manager(), getOwner().
+# Common privileged-role getter selectors (keccak256(name)[:4])
+# Computed via: keccak256("functionName()") first 4 bytes
+_ROLE_SELECTORS_PRIMARY = {
+    "owner()":              "0x8da5cb5b",
+    "manager()":            "0x481c6a75",
+    "admin()":              "0xf851a440",
+    "getOwner()":           "0x893d20e8",
+    "getManager()":         "0xd5009584",
+}
 
-    Sequential to respect Etherscan 5/sec rate limit.
-    """
-    selectors = {
-        "owner()":        "0x8da5cb5b",
-        "manager()":      "0x481c6a75",
-        "getOwner()":     "0x893d20e8",
-        "getManager()":   "0x71f3c901",
-        "admin()":        "0xf851a440",
-    }
+_ROLE_SELECTORS_EXTENDED = {
+    "getAdmin()":           "0x6e9960c3",
+    "controller()":         "0xf77c4791",
+    "governance()":         "0x5aa6e675",
+    "authority()":          "0xbf7e214f",
+    "operator()":           "0x570ca735",
+    "treasury()":           "0x61d027b3",
+    "minter()":             "0x07546172",
+    "pendingOwner()":       "0xe30c3978",
+    "pendingAdmin()":       "0x26782247",
+    "guardian()":           "0x452a9320",
+    "timelock()":           "0xd33219b4",
+    "dao()":                "0x4162169f",
+    "multisig()":           "0x4783c35b",
+    "keeper()":             "0xaced1661",
+    "vault()":              "0xfbfa77cf",
+    "feeRecipient()":       "0x46904840",
+    "feeReceiver()":        "0xb3f00674",
+}
+
+
+def _query_role_selectors(chain_id: int, address: str, api_key: str, selectors: dict) -> dict:
+    """Query a batch of selectors sequentially with rate-limit-friendly delays."""
     found = {}
     for name, sel in selectors.items():
         result = _call_view_function(chain_id, address, sel, api_key)
         addr = _decode_address(result) if result else None
         if addr and addr != "0x0000000000000000000000000000000000000000":
             found[name] = addr
-        time.sleep(0.25)  # ~4 req/sec, under the 5/sec limit
+        time.sleep(0.25)  # ~4 req/sec, under Etherscan free 5/sec limit
+    return found
+
+
+def _get_owner_or_manager(chain_id: int, address: str, api_key: str) -> dict:
+    """Detect privileged role addresses on a contract.
+
+    Two-tier strategy:
+      1. Always probe 5 most common roles (owner/manager/admin variants)
+      2. Only if NONE found, probe extended set (governance/treasury/etc)
+
+    This keeps fast path ~1.5s for typical contracts while still catching
+    unusual ones at ~6s cost.
+    """
+    found = _query_role_selectors(chain_id, address, api_key, _ROLE_SELECTORS_PRIMARY)
+    if not found:
+        # No standard roles found — try extended set
+        found = _query_role_selectors(chain_id, address, api_key, _ROLE_SELECTORS_EXTENDED)
     return found
 
 
