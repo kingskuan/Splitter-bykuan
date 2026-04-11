@@ -15,6 +15,14 @@ import requests as http_requests
 from functools import wraps
 from flask import Flask, request, jsonify
 
+# Enrichment module (on-chain data auto-fetch)
+try:
+    from enrichment import enrich_contract
+    ENRICHMENT_ENABLED = True
+except ImportError:
+    ENRICHMENT_ENABLED = False
+    print("WARNING: enrichment.py not found, skipping on-chain enrichment")
+
 app = Flask(__name__)
 
 API_KEY = os.environ.get("API_KEY", "")
@@ -900,6 +908,18 @@ def analyze():
             f"Solc {solc_version}, {duration_ms}ms."
         )
 
+        # ── On-chain enrichment: fetch live data to eliminate "please verify manually" ──
+        enriched = None
+        if ENRICHMENT_ENABLED and address:
+            chain_id = NETWORK_CHAIN_IDS.get(network)
+            if chain_id and ETHERSCAN_API_KEY:
+                try:
+                    enriched = enrich_contract(address, chain_id, ETHERSCAN_API_KEY)
+                    app.logger.info(f"Enrichment complete for {address}: {len(enriched.get('risk_flags', []))} flags")
+                except Exception as e:
+                    app.logger.warning(f"Enrichment failed: {e}")
+                    enriched = {"error": str(e)[:200]}
+
         return jsonify({
             "status": "ok",
             "contract_name": contract_name,
@@ -911,6 +931,7 @@ def analyze():
             "max_supply_analysis": max_supply_analysis,
             "owner_analysis": owner_analysis,
             "external_risks": external_risks,
+            "enriched": enriched,
             "summary": summary,
             "duration_ms": duration_ms,
         })
