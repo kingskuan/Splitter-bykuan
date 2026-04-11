@@ -240,8 +240,26 @@ def run_slither(target: str, work_dir: str, solc_path: str) -> dict:
     output = result.stdout.strip()
     stderr = result.stderr.strip()
 
-    # Log for debugging
-    app.logger.info(f"Slither exit={result.returncode}, stdout={len(output)}b, stderr={len(stderr)}b")
+    # Log for debugging — include signal detection for OOM
+    rc = result.returncode
+    signal_info = ""
+    if rc < 0:
+        signal_info = f" (killed by signal {-rc})"
+    elif rc == 137:
+        signal_info = " (SIGKILL — likely OOM)"
+    elif rc == 139:
+        signal_info = " (SIGSEGV — segfault)"
+    app.logger.info(f"Slither exit={rc}{signal_info}, stdout={len(output)}b, stderr={len(stderr)}b")
+
+    # Dump memory state on failure
+    if not output:
+        try:
+            with open("/proc/meminfo") as f:
+                meminfo = f.read()
+            mem_lines = [l for l in meminfo.split("\n") if any(k in l for k in ["MemTotal", "MemAvailable", "MemFree"])]
+            app.logger.warning(f"Memory at failure: {' | '.join(mem_lines)}")
+        except Exception:
+            pass
     if stderr:
         app.logger.info(f"Slither stderr: {stderr[:1000]}")
 
