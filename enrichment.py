@@ -12,12 +12,17 @@ Usage:
 """
 
 import json
+import time
 import concurrent.futures
 import requests as http_requests
 from typing import Optional
 
 ETHERSCAN_V2 = "https://api.etherscan.io/v2/api"
 DEXSCREENER = "https://api.dexscreener.com/latest/dex/tokens/"
+
+# Etherscan free tier: 5 calls/sec. Stay under by using 3 parallel workers
+# and retrying once on rate limit failures.
+ETHERSCAN_MAX_WORKERS = 3
 
 # Known multisig bytecode signatures (first few bytes)
 MULTISIG_SIGNATURES = {
@@ -35,29 +40,68 @@ DANGEROUS_FUNCS = {
 }
 
 
+_HEX_CHARS = set("0123456789abcdefABCDEF")
+
+
+def _is_valid_hex(s: str) -> bool:
+    """Check if a string is a 0x-prefixed hex value (Etherscan-friendly)."""
+    if not isinstance(s, str) or not s.startswith("0x"):
+        return False
+    body = s[2:]
+    if not body:
+        return False
+    return all(c in _HEX_CHARS for c in body)
+
+
 def _eth_call(chain_id: int, to: str, data: str, api_key: str, timeout: int = 10) -> Optional[str]:
-    """Make an eth_call via Etherscan V2."""
-    try:
-        params = {
-            "chainid": chain_id, "module": "proxy", "action": "eth_call",
-            "to": to, "data": data, "tag": "latest", "apikey": api_key,
-        }
-        r = http_requests.get(ETHERSCAN_V2, params=params, timeout=timeout)
-        result = r.json().get("result", "")
-        return result if result and result != "0x" else None
-    except Exception:
-        return None
+    """Make an eth_call via Etherscan V2 with one retry on rate limit.
+
+    Returns valid hex result, or None on:
+      - HTTP error
+      - Empty / "0x" result
+      - Plaintext error from Etherscan ("Max rate limit reached", etc.)
+    """
+    params = {
+        "chainid": chain_id, "module": "proxy", "action": "eth_call",
+        "to": to, "data": data, "tag": "latest", "apikey": api_key,
+    }
+    for attempt in range(2):  # try once, retry once on rate limit
+        try:
+            r = http_requests.get(ETHERSCAN_V2, params=params, timeout=timeout)
+            body = r.json()
+            result = body.get("result", "")
+
+            # Etherscan rate limit / errors come as plaintext
+            if isinstance(result, str) and "rate limit" in result.lower():
+                if attempt == 0:
+                    time.sleep(1.1)  # back off slightly over 1s
+                    continue
+                return None
+
+            if not _is_valid_hex(result) or result == "0x":
+                return None
+            return result
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            return None
+    return None
 
 
 def _get_code(chain_id: int, address: str, api_key: str) -> str:
-    """Get deployed bytecode at address. Empty = EOA."""
+    """Get deployed bytecode at address. Empty/'0x' = EOA. Returns '0x' on errors."""
     try:
         params = {
             "chainid": chain_id, "module": "proxy", "action": "eth_getCode",
             "address": address, "tag": "latest", "apikey": api_key,
         }
         r = http_requests.get(ETHERSCAN_V2, params=params, timeout=10)
-        return r.json().get("result", "0x")
+        result = r.json().get("result", "0x")
+        # Reject Etherscan plaintext errors ("rate limit reached", etc.)
+        if not _is_valid_hex(result):
+            return "0x"
+        return result
     except Exception:
         return "0x"
 
@@ -139,7 +183,10 @@ def _decode_uint(hex_result: str) -> Optional[int]:
 
 
 def _get_owner_or_manager(chain_id: int, address: str, api_key: str) -> dict:
-    """Try common privileged-role getters: owner(), manager(), getOwner()."""
+    """Try common privileged-role getters: owner(), manager(), getOwner().
+
+    Sequential to respect Etherscan 5/sec rate limit.
+    """
     selectors = {
         "owner()":        "0x8da5cb5b",
         "manager()":      "0x481c6a75",
@@ -153,6 +200,7 @@ def _get_owner_or_manager(chain_id: int, address: str, api_key: str) -> dict:
         addr = _decode_address(result) if result else None
         if addr and addr != "0x0000000000000000000000000000000000000000":
             found[name] = addr
+        time.sleep(0.25)  # ~4 req/sec, under the 5/sec limit
     return found
 
 
@@ -237,8 +285,8 @@ def enrich_contract(address: str, chain_id: int, etherscan_key: str) -> dict:
         "chain_id": chain_id,
     }
 
-    # Run independent calls in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+    # Run independent calls in parallel (limited to avoid Etherscan rate limit)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=ETHERSCAN_MAX_WORKERS) as ex:
         fut_abi = ex.submit(_get_abi, chain_id, address, etherscan_key)
         fut_creation = ex.submit(_get_creation_info, chain_id, address, etherscan_key)
         fut_supply = ex.submit(_call_view_function, chain_id, address, "0x18160ddd", etherscan_key)  # totalSupply()
@@ -272,7 +320,8 @@ def enrich_contract(address: str, chain_id: int, etherscan_key: str) -> dict:
     result["creation_tx"] = creation.get("tx_hash", "")
 
     # Privileged roles (owner / manager / admin)
-    # For each role address, detect if it's a multisig
+    # For each role address, detect if it's a multisig (sequential w/ delay
+    # to respect Etherscan rate limit)
     role_details = {}
     for role_name, role_addr in roles.items():
         code = _get_code(chain_id, role_addr, etherscan_key)
@@ -281,6 +330,7 @@ def enrich_contract(address: str, chain_id: int, etherscan_key: str) -> dict:
             "address": role_addr,
             **wallet,
         }
+        time.sleep(0.25)
     result["privileged_roles"] = role_details
 
     # DexScreener data
