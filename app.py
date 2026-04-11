@@ -566,6 +566,194 @@ def extract_centralization_risks(source_code: str) -> dict:
     return risks
 
 
+# Known contract bytecode signatures for owner type detection
+GNOSIS_SAFE_MARKERS = [
+    "a619486e",  # masterCopy selector
+    "6a761202",  # execTransaction selector
+    "468721a7",  # execTransactionFromModule
+]
+TIMELOCK_MARKERS = [
+    "31d50750",  # getMinDelay
+    "8f2a0bb0",  # scheduleBatch
+    "134008d3",  # execute(bytes32,...)
+]
+
+
+def analyze_owner_address(contract_address: str, network: str) -> dict:
+    """Fetch contract owner() and classify as EOA / Multisig / Timelock / Unknown."""
+    chain_id = NETWORK_CHAIN_IDS.get(network)
+    if not chain_id or not ETHERSCAN_API_KEY:
+        return {"available": False, "reason": "No API key or unsupported network"}
+
+    try:
+        # Step 1: eth_call to owner() selector 0x8da5cb5b
+        call_params = {
+            "chainid": chain_id,
+            "module": "proxy",
+            "action": "eth_call",
+            "to": contract_address,
+            "data": "0x8da5cb5b",  # owner()
+            "tag": "latest",
+            "apikey": ETHERSCAN_API_KEY,
+        }
+        r1 = http_requests.get(ETHERSCAN_V2_URL, params=call_params, timeout=15)
+        result_hex = r1.json().get("result", "")
+
+        if not result_hex or result_hex == "0x" or len(result_hex) < 66:
+            # Try manager() selector 0x481c6a75 as fallback
+            call_params["data"] = "0x481c6a75"
+            r1 = http_requests.get(ETHERSCAN_V2_URL, params=call_params, timeout=15)
+            result_hex = r1.json().get("result", "")
+
+        if not result_hex or result_hex == "0x" or len(result_hex) < 66:
+            return {"available": False, "reason": "Contract has no owner()/manager() function"}
+
+        # Parse address from 32-byte result (last 20 bytes)
+        owner_addr = "0x" + result_hex[-40:]
+        if owner_addr == "0x" + "0" * 40:
+            return {
+                "available": True,
+                "owner_address": owner_addr,
+                "owner_type": "Renounced (zero address)",
+                "risk_level": "low",
+                "description": "Ownership renounced - no admin can modify contract",
+            }
+
+        # Step 2: eth_getCode on owner address
+        code_params = {
+            "chainid": chain_id,
+            "module": "proxy",
+            "action": "eth_getCode",
+            "address": owner_addr,
+            "tag": "latest",
+            "apikey": ETHERSCAN_API_KEY,
+        }
+        r2 = http_requests.get(ETHERSCAN_V2_URL, params=code_params, timeout=15)
+        code = (r2.json().get("result") or "0x").lower()
+
+        if code == "0x" or len(code) < 10:
+            # EOA - externally owned account, single private key
+            return {
+                "available": True,
+                "owner_address": owner_addr,
+                "owner_type": "EOA (single private key)",
+                "risk_level": "critical",
+                "description": "Owner is an EOA - single point of failure. If private key is compromised, attacker gains full control.",
+            }
+
+        # Contract - check bytecode markers
+        is_safe = any(marker in code for marker in GNOSIS_SAFE_MARKERS)
+        is_timelock = any(marker in code for marker in TIMELOCK_MARKERS)
+
+        if is_timelock:
+            return {
+                "available": True,
+                "owner_address": owner_addr,
+                "owner_type": "TimelockController",
+                "risk_level": "low",
+                "description": "Owner is a Timelock - admin actions delayed, giving users time to react.",
+            }
+        if is_safe:
+            # Try to get threshold via getThreshold() selector 0xe75235b8
+            call_params["to"] = owner_addr
+            call_params["data"] = "0xe75235b8"
+            r3 = http_requests.get(ETHERSCAN_V2_URL, params=call_params, timeout=15)
+            thresh_hex = r3.json().get("result", "0x0")
+            threshold = int(thresh_hex, 16) if thresh_hex and thresh_hex != "0x" else 0
+            return {
+                "available": True,
+                "owner_address": owner_addr,
+                "owner_type": f"Gnosis Safe multisig (threshold={threshold})",
+                "risk_level": "medium" if threshold >= 3 else "high",
+                "description": f"Owner is a Gnosis Safe requiring {threshold} signature(s). Safer than EOA but trust depends on signers.",
+            }
+
+        return {
+            "available": True,
+            "owner_address": owner_addr,
+            "owner_type": "Unknown contract",
+            "risk_level": "high",
+            "description": "Owner is a contract but not a recognized multisig or timelock. Manual verification required.",
+        }
+    except Exception as e:
+        return {"available": False, "reason": f"Owner analysis failed: {str(e)[:200]}"}
+
+
+def analyze_max_supply(source_code: str) -> dict:
+    """Deep analysis of _maxSupply / MAX_SUPPLY in the contract."""
+    # Strip comments
+    code = re.sub(r"//.*?$", "", source_code, flags=re.MULTILINE)
+    code = re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
+
+    result = {
+        "has_cap": False,
+        "cap_value": None,
+        "is_mutable": None,
+        "is_constant": False,
+        "is_immutable": False,
+        "setter_function": None,
+        "is_erc20votes_default": False,
+        "description": "",
+    }
+
+    # Check for ERC20Votes default _maxSupply (2^224 - 1, effectively unlimited)
+    if re.search(r"_maxSupply\s*\(\s*\)\s*internal\s+view\s+virtual\s+returns", code):
+        # Has override or uses default ERC20Votes
+        override_match = re.search(
+            r"function\s+_maxSupply\s*\(\s*\)\s*internal\s+view\s+(?:virtual\s+)?(?:override\s+)?returns\s*\([^)]*\)\s*\{([^}]+)\}",
+            code,
+        )
+        if override_match:
+            body = override_match.group(1).strip()
+            result["cap_value"] = body[:200]
+        else:
+            result["is_erc20votes_default"] = True
+            result["cap_value"] = "2^224 - 1 (ERC20Votes default, effectively unlimited)"
+            result["description"] = "Uses ERC20Votes default _maxSupply = 2^224-1 ≈ 26.9 billion billion tokens. This is NOT a real cap."
+
+    # Look for MAX_SUPPLY / _maxSupply state variable
+    var_patterns = [
+        (r"uint\d*\s+(?:public\s+|private\s+|internal\s+)?constant\s+(?:MAX_SUPPLY|_maxSupply|maxSupply)\s*=\s*([^;]+);", "constant"),
+        (r"uint\d*\s+(?:public\s+|private\s+|internal\s+)?immutable\s+(?:MAX_SUPPLY|_maxSupply|maxSupply)\s*=\s*([^;]+);", "immutable"),
+        (r"uint\d*\s+(?:public\s+|private\s+|internal\s+)?(?:MAX_SUPPLY|_maxSupply|maxSupply)\s*=\s*([^;]+);", "storage"),
+    ]
+
+    for pattern, kind in var_patterns:
+        m = re.search(pattern, code)
+        if m:
+            result["has_cap"] = True
+            result["cap_value"] = m.group(1).strip()[:100]
+            if kind == "constant":
+                result["is_constant"] = True
+                result["is_mutable"] = False
+                result["description"] = f"MAX_SUPPLY is a hardcoded constant: {result['cap_value']}"
+            elif kind == "immutable":
+                result["is_immutable"] = True
+                result["is_mutable"] = False
+                result["description"] = f"MAX_SUPPLY is immutable (set at deploy): {result['cap_value']}"
+            else:
+                result["is_mutable"] = True
+                result["description"] = f"MAX_SUPPLY is a mutable storage variable - may be changeable by owner!"
+            break
+
+    # Look for setter functions
+    setter_patterns = [
+        r"function\s+(setMaxSupply|updateMaxSupply|_setMaxSupply|changeMaxSupply)\s*\(",
+    ]
+    for p in setter_patterns:
+        m = re.search(p, code)
+        if m:
+            result["setter_function"] = m.group(1)
+            result["is_mutable"] = True
+            result["description"] += f" Setter function '{m.group(1)}' exists - owner can raise the cap."
+            break
+
+    if not result["has_cap"] and not result["is_erc20votes_default"]:
+        result["description"] = "No explicit MAX_SUPPLY found. Check mint() logic for hidden limits."
+
+    return result
+
+
 def categorize_findings(slither_output: dict) -> dict:
     """Extract and categorize findings by impact level."""
     categories = {"critical": [], "high": [], "medium": [], "low": []}
@@ -664,10 +852,15 @@ def analyze():
         # Step 3.5: Extract centralization/trust risks via regex (fast, no LLM)
         centralization_risks = extract_centralization_risks(source_code)
 
+        # Step 3.55: Deep max_supply analysis
+        max_supply_analysis = analyze_max_supply(source_code)
+
         # Step 3.6: Fetch external/live-state risks via GoPlus (only if we have an address)
         external_risks = {"available": False, "reason": "no address provided"}
+        owner_analysis = {"available": False, "reason": "no address provided"}
         if address:
             external_risks = fetch_external_risks(address, network)
+            owner_analysis = analyze_owner_address(address, network)
 
         # Step 4: Run Slither with explicit solc binary
         slither_output = run_slither(target, work_dir, solc_path)
@@ -715,6 +908,8 @@ def analyze():
             "solc_version": solc_version,
             "findings": findings,
             "centralization_risks": centralization_risks,
+            "max_supply_analysis": max_supply_analysis,
+            "owner_analysis": owner_analysis,
             "external_risks": external_risks,
             "summary": summary,
             "duration_ms": duration_ms,
