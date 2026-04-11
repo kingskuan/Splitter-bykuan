@@ -16,12 +16,14 @@ from functools import wraps
 from flask import Flask, request, jsonify
 
 # Enrichment module (on-chain data auto-fetch)
+ENRICHMENT_IMPORT_ERROR = None
 try:
     from enrichment import enrich_contract
     ENRICHMENT_ENABLED = True
-except ImportError:
+except Exception as _e:
     ENRICHMENT_ENABLED = False
-    print("WARNING: enrichment.py not found, skipping on-chain enrichment")
+    ENRICHMENT_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+    print(f"WARNING: enrichment.py import failed: {ENRICHMENT_IMPORT_ERROR}")
 
 app = Flask(__name__)
 
@@ -811,11 +813,19 @@ def health():
 @app.route("/debug", methods=["GET"])
 def debug():
     """Diagnostic endpoint - check config without exposing secrets."""
+    import os as _os
+    files_in_dir = []
+    try:
+        files_in_dir = sorted(_os.listdir("/app"))
+    except Exception:
+        pass
     return jsonify({
         "enrichment_enabled": ENRICHMENT_ENABLED,
+        "enrichment_import_error": ENRICHMENT_IMPORT_ERROR,
         "etherscan_key_set": bool(ETHERSCAN_API_KEY),
         "etherscan_key_length": len(ETHERSCAN_API_KEY) if ETHERSCAN_API_KEY else 0,
         "api_key_set": bool(API_KEY),
+        "files_in_app_dir": files_in_dir,
         "supported_networks": list(NETWORK_CHAIN_IDS.keys()),
     })
 
