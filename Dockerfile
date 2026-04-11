@@ -11,15 +11,27 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install solc 0.8.20 directly from solidity binaries CDN
-# Bypasses solc-select's GitHub API call which gets rate-limited in CI
-RUN mkdir -p /root/.solc-select/artifacts/solc-0.8.20 && \
-    wget -q https://github.com/ethereum/solidity/releases/download/v0.8.20/solc-static-linux \
-        -O /root/.solc-select/artifacts/solc-0.8.20/solc-0.8.20 && \
-    chmod +x /root/.solc-select/artifacts/solc-0.8.20/solc-0.8.20 && \
+# Pre-install multiple solc versions covering historical Solidity releases.
+# Direct binary downloads bypass solc-select's GitHub API (rate limited in CI).
+# Each version ~30MB, total ~300MB (acceptable).
+#
+# Coverage rationale:
+#   0.4.26 — latest 0.4.x, covers USDT and most 2017-2018 tokens
+#   0.5.17 — latest 0.5.x, covers 2018-2019 contracts
+#   0.6.12 — latest 0.6.x, covers 2019-2020 contracts (incl. many DeFi)
+#   0.7.6  — latest 0.7.x, covers Uniswap V3 era
+#   0.8.20 — modern default, covers 2021+ contracts
+#   0.8.26 — latest stable for newest contracts
+RUN set -e && \
+    for VERSION in 0.4.26 0.5.17 0.6.12 0.7.6 0.8.20 0.8.26; do \
+        mkdir -p /root/.solc-select/artifacts/solc-${VERSION} && \
+        wget -q "https://github.com/ethereum/solidity/releases/download/v${VERSION}/solc-static-linux" \
+            -O /root/.solc-select/artifacts/solc-${VERSION}/solc-${VERSION} && \
+        chmod +x /root/.solc-select/artifacts/solc-${VERSION}/solc-${VERSION} && \
+        /root/.solc-select/artifacts/solc-${VERSION}/solc-${VERSION} --version ; \
+    done && \
     echo '0.8.20' > /root/.solc-select/global-version && \
-    ln -sf /root/.solc-select/artifacts/solc-0.8.20/solc-0.8.20 /usr/local/bin/solc && \
-    /root/.solc-select/artifacts/solc-0.8.20/solc-0.8.20 --version
+    ln -sf /root/.solc-select/artifacts/solc-0.8.20/solc-0.8.20 /usr/local/bin/solc
 
 # Copy all Python modules (app.py, enrichment.py, and any future modules)
 COPY *.py ./

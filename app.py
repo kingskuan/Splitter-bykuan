@@ -158,11 +158,32 @@ def resolve_solc_binary(version: str) -> str:
     if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
         return binary_path
 
-    # Not the requested version — fall back to pre-installed default.
-    # We NEVER call solc-select because it corrupts global state and fails
-    # on Railway due to GitHub API rate limits.
+    # Find closest pre-installed version matching the same major.minor line
+    # e.g. 0.4.18 → 0.4.26, 0.5.0 → 0.5.17, 0.6.0 → 0.6.12
+    try:
+        parts = version.split(".")
+        major_minor = f"{parts[0]}.{parts[1]}"
+    except Exception:
+        major_minor = None
+
+    if os.path.isdir(_SOLC_ARTIFACTS_DIR) and major_minor:
+        candidates = []
+        for entry in os.listdir(_SOLC_ARTIFACTS_DIR):
+            if entry.startswith(f"solc-{major_minor}."):
+                ver_str = entry.replace("solc-", "")
+                path = os.path.join(_SOLC_ARTIFACTS_DIR, entry, f"solc-{ver_str}")
+                if os.path.exists(path) and os.access(path, os.X_OK):
+                    candidates.append((ver_str, path))
+        if candidates:
+            # Pick the highest patch version on the same 0.X line
+            candidates.sort(key=lambda x: [int(n) for n in x[0].split(".")])
+            chosen_ver, chosen_path = candidates[-1]
+            app.logger.warning(f"[SOLC-MATCH] requested={version} → using closest pre-installed {chosen_ver}")
+            return chosen_path
+
+    # Last resort: use default (must be pre-installed)
     default_path = os.path.join(_SOLC_ARTIFACTS_DIR, f"solc-{_DEFAULT_SOLC}", f"solc-{_DEFAULT_SOLC}")
-    app.logger.warning(f"solc {version} not pre-installed, using default {_DEFAULT_SOLC} at {default_path}")
+    app.logger.warning(f"[SOLC-FALLBACK] requested={version} not found, using default {_DEFAULT_SOLC}")
     if not os.path.exists(default_path):
         raise RuntimeError(f"Default solc {_DEFAULT_SOLC} missing from container at {default_path}")
     return default_path
@@ -207,6 +228,29 @@ def run_slither(target: str, work_dir: str, solc_path: str) -> dict:
     except Exception as e:
         app.logger.warning(f"[SOLC-CHECK-FAIL] {solc_path}: {e}")
         raise RuntimeError(f"Cannot execute solc: {e}")
+
+    # Pre-compile sanity check: can solc actually handle this file?
+    # This surfaces "version mismatch" errors that Slither swallows silently.
+    if os.path.isfile(target):
+        try:
+            compile_check = subprocess.run(
+                [solc_path, "--combined-json", "abi", target],
+                capture_output=True, text=True, timeout=30, cwd=work_dir
+            )
+            if compile_check.returncode != 0:
+                err_preview = (compile_check.stderr or compile_check.stdout or "").strip()[:600]
+                app.logger.warning(f"[SOLC-COMPILE-FAIL] exit={compile_check.returncode} err={err_preview!r}")
+                raise RuntimeError(
+                    f"solc cannot compile contract (possibly wrong version). "
+                    f"Using {os.path.basename(solc_path)}. Error: {err_preview[:400]}"
+                )
+            app.logger.warning(f"[SOLC-COMPILE-OK] target compiles cleanly with {os.path.basename(solc_path)}")
+        except subprocess.TimeoutExpired:
+            app.logger.warning("[SOLC-COMPILE-TIMEOUT] skipping pre-check")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            app.logger.warning(f"[SOLC-COMPILE-SKIP] {e}")
 
     cmd = [
         "slither", target,
