@@ -158,25 +158,13 @@ def resolve_solc_binary(version: str) -> str:
     if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
         return binary_path
 
-    # Not pre-installed — try to download. Use solc-select as a last resort.
-    # This path mutates global state briefly, but we still return the binary
-    # path afterwards so concurrent requests for different versions don't
-    # collide during actual Slither execution.
-    app.logger.info(f"solc {version} not pre-installed, downloading via solc-select")
-    try:
-        result = subprocess.run(
-            ["solc-select", "install", version],
-            capture_output=True, text=True, timeout=120, check=False
-        )
-        app.logger.info(f"solc-select install {version}: exit={result.returncode}")
-        if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
-            return binary_path
-    except Exception as e:
-        app.logger.warning(f"Failed to install solc {version}: {e}")
-
-    # Final fallback: default version (must be pre-installed)
+    # Not the requested version — fall back to pre-installed default.
+    # We NEVER call solc-select because it corrupts global state and fails
+    # on Railway due to GitHub API rate limits.
     default_path = os.path.join(_SOLC_ARTIFACTS_DIR, f"solc-{_DEFAULT_SOLC}", f"solc-{_DEFAULT_SOLC}")
-    app.logger.warning(f"Falling back to {_DEFAULT_SOLC} at {default_path}")
+    app.logger.warning(f"solc {version} not pre-installed, using default {_DEFAULT_SOLC} at {default_path}")
+    if not os.path.exists(default_path):
+        raise RuntimeError(f"Default solc {_DEFAULT_SOLC} missing from container at {default_path}")
     return default_path
 
 
@@ -212,12 +200,13 @@ def prepare_source_files(work_dir: str, source_code: str, contract_name: str) ->
 
 def run_slither(target: str, work_dir: str, solc_path: str) -> dict:
     """Run Slither analysis with explicit solc binary (no global state)."""
-    # Diagnostic: check solc binary
+    # Diagnostic: check solc binary (WARNING level so it shows in Railway)
     try:
         ver = subprocess.run([solc_path, "--version"], capture_output=True, text=True, timeout=5)
-        app.logger.info(f"Using solc at {solc_path}: {ver.stdout[:150]}")
+        app.logger.warning(f"[SOLC-CHECK] path={solc_path} exit={ver.returncode} stdout={ver.stdout[:150]!r} stderr={ver.stderr[:150]!r}")
     except Exception as e:
-        app.logger.warning(f"Cannot invoke solc at {solc_path}: {e}")
+        app.logger.warning(f"[SOLC-CHECK-FAIL] {solc_path}: {e}")
+        raise RuntimeError(f"Cannot execute solc: {e}")
 
     cmd = [
         "slither", target,
@@ -226,7 +215,7 @@ def run_slither(target: str, work_dir: str, solc_path: str) -> dict:
         "--exclude-informational",
         "--exclude-optimization",
     ]
-    app.logger.info(f"Running: slither {target} --solc {solc_path} (cwd={work_dir})")
+    app.logger.warning(f"[SLITHER-RUN] cmd={' '.join(cmd)} cwd={work_dir}")
 
     result = subprocess.run(
         cmd,
@@ -249,7 +238,7 @@ def run_slither(target: str, work_dir: str, solc_path: str) -> dict:
         signal_info = " (SIGKILL — likely OOM)"
     elif rc == 139:
         signal_info = " (SIGSEGV — segfault)"
-    app.logger.info(f"Slither exit={rc}{signal_info}, stdout={len(output)}b, stderr={len(stderr)}b")
+    app.logger.warning(f"[SLITHER-EXIT] code={rc}{signal_info}, stdout={len(output)}b, stderr={len(stderr)}b")
 
     # Dump memory state on failure
     if not output:
