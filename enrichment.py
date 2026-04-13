@@ -640,25 +640,23 @@ def format_enrichment_for_prompt(enriched: dict) -> str:
     else:
         lines.append("\nMarket Data: NO LIQUIDITY FOUND on DEX")
 
-    # Mint history
+    # Mint history — only include if successfully fetched with meaningful data
+    # When Alchemy fails or returns empty, silently skip (don't confuse Claude)
     mh = enriched.get("mint_history", {})
-    if mh.get("available"):
-        if mh.get("mint_count", 0) == 0:
-            lines.append(f"\nMint History: {mh.get('note', 'No mints')}")
-        else:
-            lines.append(f"\nMint History (实际增发记录):")
-            lines.append(f"  Total mint events: {mh['mint_count']}")
-            lines.append(f"  Total minted ever: {mh['total_minted']:,.2f}")
-            lines.append(f"  Largest single mint: {mh['largest_single_mint']:,.2f}")
-            lines.append(f"  Last mint: {mh['last_mint_days_ago']} days ago")
-            lines.append(f"  Past 30 days minted: {mh['recent_30d_minted']:,.2f} ({mh['recent_30d_pct']}% of total)")
-            top = mh.get("top_recipients", [])
-            if top:
-                lines.append(f"  Top mint recipients:")
-                for r in top:
-                    lines.append(f"    {r['address'][:10]}... received {r['amount']:,.2f} ({r['pct']}%)")
-            if mh.get("truncated"):
-                lines.append(f"  (Note: showing latest 1000 mint events, may have more history)")
+    if mh.get("available") and mh.get("mint_count", 0) > 0:
+        lines.append(f"\nMint History (实际增发记录):")
+        lines.append(f"  Total mint events: {mh['mint_count']}")
+        lines.append(f"  Total minted ever: {mh['total_minted']:,.2f}")
+        lines.append(f"  Largest single mint: {mh['largest_single_mint']:,.2f}")
+        lines.append(f"  Last mint: {mh['last_mint_days_ago']} days ago")
+        lines.append(f"  Past 30 days minted: {mh['recent_30d_minted']:,.2f} ({mh['recent_30d_pct']}% of total)")
+        top = mh.get("top_recipients", [])
+        if top:
+            lines.append(f"  Top mint recipients:")
+            for r in top:
+                lines.append(f"    {r['address'][:10]}... received {r['amount']:,.2f} ({r['pct']}%)")
+        if mh.get("truncated"):
+            lines.append(f"  (Note: showing latest 1000 mint events, may have more history)")
 
     # Risk flags
     flags = enriched.get("risk_flags", [])
