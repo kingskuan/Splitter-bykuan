@@ -189,25 +189,55 @@ def resolve_solc_binary(version: str) -> str:
     return default_path
 
 
-def prepare_source_files(work_dir: str, source_code: str, contract_name: str) -> str:
-    """Write source code to temp directory, handling single and multi-file formats."""
+def prepare_source_files(work_dir: str, source_code: str, contract_name: str):
+    """Write source code to temp directory, handling single and multi-file formats.
+
+    Returns (target_path, remappings_list) where remappings is a list of
+    "@package/=absolute/path/" strings for solc --allow-paths + remapping.
+    """
+    remappings = set()
     try:
         # Try parsing as JSON (multi-file format from Etherscan)
         sources = json.loads(source_code)
         if isinstance(sources, dict):
             # Could be {sources: {}, settings: {}} or direct {filename: {content: ...}}
+            # Also preserve original remappings from solc settings if present
+            if "settings" in sources and isinstance(sources.get("settings"), dict):
+                orig_remap = sources["settings"].get("remappings", [])
+                if isinstance(orig_remap, list):
+                    for r in orig_remap:
+                        if isinstance(r, str):
+                            remappings.add(r)
             if "sources" in sources:
                 sources = sources["sources"]
             main_file = None
+            written_files = []
             for filename, content in sources.items():
-                filepath = os.path.join(work_dir, filename)
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                # Sanitize: filenames may start with / or have .. — normalize
+                safe_name = filename.lstrip("/")
+                filepath = os.path.join(work_dir, safe_name)
+                os.makedirs(os.path.dirname(filepath) or work_dir, exist_ok=True)
                 code = content if isinstance(content, str) else content.get("content", "")
                 with open(filepath, "w") as f:
                     f.write(code)
+                written_files.append(safe_name)
+
+                # Build implicit remappings for any @scope/package prefix found
+                # e.g. "@openzeppelin/contracts/access/Ownable.sol" →
+                #      "@openzeppelin/=<work_dir>/@openzeppelin/"
+                if safe_name.startswith("@"):
+                    # Get top-level prefix like "@openzeppelin/"
+                    parts = safe_name.split("/", 1)
+                    if len(parts) > 1:
+                        prefix = parts[0] + "/"
+                        remappings.add(f"{prefix}={os.path.join(work_dir, prefix)}")
+
                 if main_file is None and contract_name and contract_name in filename:
                     main_file = filepath
-            return main_file or work_dir  # Slither can analyze a directory
+
+            app.logger.warning(f"[PREPARE] wrote {len(written_files)} files, "
+                               f"remappings={sorted(remappings)[:5]}...")
+            return (main_file or work_dir, sorted(remappings))
     except (json.JSONDecodeError, AttributeError):
         pass
 
@@ -216,11 +246,16 @@ def prepare_source_files(work_dir: str, source_code: str, contract_name: str) ->
     filepath = os.path.join(work_dir, filename)
     with open(filepath, "w") as f:
         f.write(source_code)
-    return filepath
+    return (filepath, [])
 
 
-def run_slither(target: str, work_dir: str, solc_path: str) -> dict:
-    """Run Slither analysis with explicit solc binary (no global state)."""
+def run_slither(target: str, work_dir: str, solc_path: str, remappings=None) -> dict:
+    """Run Slither analysis with explicit solc binary (no global state).
+
+    remappings: list of "@scope/=path/" strings for npm-style imports.
+    """
+    remappings = remappings or []
+
     # Diagnostic: check solc binary (WARNING level so it shows in Railway)
     try:
         ver = subprocess.run([solc_path, "--version"], capture_output=True, text=True, timeout=5)
@@ -230,11 +265,14 @@ def run_slither(target: str, work_dir: str, solc_path: str) -> dict:
         raise RuntimeError(f"Cannot execute solc: {e}")
 
     # Pre-compile sanity check: can solc actually handle this file?
-    # This surfaces "version mismatch" errors that Slither swallows silently.
+    # Use remappings + allow-paths so npm-style imports (@openzeppelin/...) resolve.
     if os.path.isfile(target):
         try:
+            compile_cmd = [solc_path, "--allow-paths", work_dir]
+            compile_cmd.extend(remappings)
+            compile_cmd.extend(["--combined-json", "abi", target])
             compile_check = subprocess.run(
-                [solc_path, "--combined-json", "abi", target],
+                compile_cmd,
                 capture_output=True, text=True, timeout=30, cwd=work_dir
             )
             if compile_check.returncode != 0:
@@ -259,6 +297,9 @@ def run_slither(target: str, work_dir: str, solc_path: str) -> dict:
         "--exclude-informational",
         "--exclude-optimization",
     ]
+    # Pass remappings to Slither via --solc-remaps
+    if remappings:
+        cmd.extend(["--solc-remaps", " ".join(remappings)])
     app.logger.warning(f"[SLITHER-RUN] cmd={' '.join(cmd)} cwd={work_dir}")
 
     result = subprocess.run(
@@ -928,7 +969,7 @@ def analyze():
         solc_path = resolve_solc_binary(solc_version)
 
         # Step 3: Write source files
-        target = prepare_source_files(work_dir, source_code, contract_name)
+        target, remappings = prepare_source_files(work_dir, source_code, contract_name)
 
         # Step 3.5: Extract centralization/trust risks via regex (fast, no LLM)
         centralization_risks = extract_centralization_risks(source_code)
@@ -944,7 +985,7 @@ def analyze():
             owner_analysis = analyze_owner_address(address, network)
 
         # Step 4: Run Slither with explicit solc binary
-        slither_output = run_slither(target, work_dir, solc_path)
+        slither_output = run_slither(target, work_dir, solc_path, remappings)
 
         # Step 5: Categorize findings
         findings = categorize_findings(slither_output)
