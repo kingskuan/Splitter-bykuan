@@ -310,6 +310,117 @@ def _fetch_dexscreener(address: str) -> dict:
         return {"has_liquidity": False, "error": str(e)[:100]}
 
 
+def _fetch_mint_history(chain_id: int, address: str, decimals: int, api_key: str) -> dict:
+    """Fetch all mint events (Transfer from 0x0) for this token via Etherscan V2.
+
+    Returns aggregated stats:
+      - mint_count: total number of mint transactions
+      - total_minted: sum of all minted amounts (human-readable)
+      - largest_single_mint: biggest one-time mint
+      - last_mint_timestamp: unix ts of most recent mint
+      - last_mint_days_ago: days since most recent mint
+      - recent_30d_minted: amount minted in past 30 days
+      - recent_30d_pct: % of total supply minted in past 30 days
+      - top_recipients: top 3 addresses receiving mints
+    """
+    try:
+        # Use tokentx endpoint - returns ERC20 transfers TO this address from address(0)
+        # Etherscan V2: action=tokentx with contractaddress filter
+        params = {
+            "chainid": chain_id,
+            "module": "account",
+            "action": "tokentx",
+            "contractaddress": address,
+            "address": "0x0000000000000000000000000000000000000000",
+            "page": 1,
+            "offset": 1000,  # max 1000 per call, should cover most tokens
+            "sort": "desc",  # newest first
+            "apikey": api_key,
+        }
+        r = http_requests.get(ETHERSCAN_V2, params=params, timeout=15)
+        body = r.json()
+
+        if body.get("status") != "1":
+            # No transactions or error — possibly "No transactions found"
+            return {
+                "available": False,
+                "reason": body.get("message", "unknown")[:80],
+            }
+
+        txs = body.get("result", [])
+        if not isinstance(txs, list):
+            return {"available": False, "reason": "invalid response"}
+
+        # Filter: only mints (from = 0x0...) — sometimes tokentx returns burns too
+        mints = [
+            tx for tx in txs
+            if tx.get("from", "").lower() == "0x0000000000000000000000000000000000000000"
+        ]
+
+        if not mints:
+            return {
+                "available": True,
+                "mint_count": 0,
+                "total_minted": 0,
+                "note": "No mint events ever (initial supply only or non-mintable)",
+            }
+
+        # Aggregate
+        divisor = 10 ** decimals
+        amounts = []
+        recipients = {}
+        timestamps = []
+
+        for tx in mints:
+            try:
+                amount = int(tx.get("value", "0")) / divisor
+                amounts.append(amount)
+                ts = int(tx.get("timeStamp", "0"))
+                timestamps.append(ts)
+                to_addr = tx.get("to", "").lower()
+                recipients[to_addr] = recipients.get(to_addr, 0) + amount
+            except (ValueError, TypeError):
+                continue
+
+        if not amounts:
+            return {"available": True, "mint_count": 0}
+
+        total_minted = sum(amounts)
+        largest = max(amounts)
+        last_ts = max(timestamps)
+        now_ts = int(time.time())
+        days_ago = (now_ts - last_ts) / 86400
+
+        # Past 30 days
+        cutoff_30d = now_ts - (30 * 86400)
+        recent_30d = sum(
+            amt for amt, ts in zip(amounts, timestamps) if ts >= cutoff_30d
+        )
+        recent_30d_pct = (recent_30d / total_minted * 100) if total_minted > 0 else 0
+
+        # Top 3 recipients
+        top_recipients = sorted(recipients.items(), key=lambda x: -x[1])[:3]
+        top_recipients_fmt = [
+            {"address": addr, "amount": round(amt, 4), "pct": round(amt / total_minted * 100, 2)}
+            for addr, amt in top_recipients
+        ]
+
+        return {
+            "available": True,
+            "mint_count": len(mints),
+            "total_minted": round(total_minted, 4),
+            "largest_single_mint": round(largest, 4),
+            "last_mint_timestamp": last_ts,
+            "last_mint_days_ago": round(days_ago, 1),
+            "recent_30d_minted": round(recent_30d, 4),
+            "recent_30d_pct": round(recent_30d_pct, 2),
+            "top_recipients": top_recipients_fmt,
+            "truncated": len(txs) >= 1000,  # may have more history beyond 1000 events
+        }
+    except Exception as e:
+        return {"available": False, "reason": str(e)[:100]}
+
+
 def enrich_contract(address: str, chain_id: int, etherscan_key: str) -> dict:
     """
     Fetch all enrichment data in parallel.
@@ -353,6 +464,17 @@ def enrich_contract(address: str, chain_id: int, etherscan_key: str) -> dict:
     result["cap"] = (cap_raw / 10**decimals) if cap_raw else None
     result["decimals"] = decimals
 
+    # Mint history (needs decimals, so runs after parallel batch)
+    # Only fetch if contract has mint capability (saves API call for non-mintable tokens)
+    mint_analysis = _analyze_abi(abi)  # quick re-check inline
+    if mint_analysis.get("has_mint"):
+        result["mint_history"] = _fetch_mint_history(chain_id, address, decimals, etherscan_key)
+    else:
+        result["mint_history"] = {
+            "available": True, "mint_count": 0,
+            "note": "Contract has no mint() function",
+        }
+
     # Deployer
     result["deployer"] = creation.get("deployer", "")
     result["creation_tx"] = creation.get("tx_hash", "")
@@ -394,6 +516,20 @@ def enrich_contract(address: str, chain_id: int, etherscan_key: str) -> dict:
         flags.append("NO_LIQUIDITY")
     elif dex_data.get("liquidity_usd", 0) < 10000:
         flags.append("LOW_LIQUIDITY")
+
+    # Mint history flags
+    mh = result.get("mint_history", {})
+    if mh.get("available") and mh.get("mint_count", 0) > 0:
+        # Recent aggressive minting (>5% of supply in past 30 days)
+        if mh.get("recent_30d_pct", 0) > 5:
+            flags.append("RECENT_HEAVY_MINT")
+        # Concentrated minting (top recipient got >80% of all mints)
+        top = mh.get("top_recipients", [])
+        if top and top[0].get("pct", 0) > 80:
+            flags.append("CONCENTRATED_MINT_RECIPIENT")
+        # Very recent mint activity
+        if mh.get("last_mint_days_ago", 999) < 7:
+            flags.append("ACTIVE_MINTING_THIS_WEEK")
 
     result["risk_flags"] = flags
     return result
@@ -446,6 +582,26 @@ def format_enrichment_for_prompt(enriched: dict) -> str:
         lines.append(f"  Trading on: {market['main_dex']} ({market['pair_count']} pairs)")
     else:
         lines.append("\nMarket Data: NO LIQUIDITY FOUND on DEX")
+
+    # Mint history
+    mh = enriched.get("mint_history", {})
+    if mh.get("available"):
+        if mh.get("mint_count", 0) == 0:
+            lines.append(f"\nMint History: {mh.get('note', 'No mints')}")
+        else:
+            lines.append(f"\nMint History (实际增发记录):")
+            lines.append(f"  Total mint events: {mh['mint_count']}")
+            lines.append(f"  Total minted ever: {mh['total_minted']:,.2f}")
+            lines.append(f"  Largest single mint: {mh['largest_single_mint']:,.2f}")
+            lines.append(f"  Last mint: {mh['last_mint_days_ago']} days ago")
+            lines.append(f"  Past 30 days minted: {mh['recent_30d_minted']:,.2f} ({mh['recent_30d_pct']}% of total)")
+            top = mh.get("top_recipients", [])
+            if top:
+                lines.append(f"  Top mint recipients:")
+                for r in top:
+                    lines.append(f"    {r['address'][:10]}... received {r['amount']:,.2f} ({r['pct']}%)")
+            if mh.get("truncated"):
+                lines.append(f"  (Note: showing latest 1000 mint events, may have more history)")
 
     # Risk flags
     flags = enriched.get("risk_flags", [])
