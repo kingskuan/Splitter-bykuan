@@ -353,32 +353,52 @@ def _fetch_mint_history(chain_id: int, address: str, decimals: int, api_key: str
 
     url = f"https://{network}.g.alchemy.com/v2/{alchemy_key}"
 
+    # Try with decreasing batch sizes — large DAI/USDT history may timeout at 1000
+    for max_count_hex, retry_label in [("0x64", "100"), ("0x32", "50")]:
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "alchemy_getAssetTransfers",
+                "params": [{
+                    "fromAddress": "0x0000000000000000000000000000000000000000",
+                    "contractAddresses": [address],
+                    "category": ["erc20"],
+                    "withMetadata": True,
+                    "maxCount": max_count_hex,
+                    "order": "desc",
+                }],
+            }
+            r = http_requests.post(url, json=payload, timeout=30)
+            body = r.json()
+
+            if "error" in body:
+                err_msg = str(body.get("error", {}).get("message", ""))[:100]
+                logger.warning(f"[MINT-ALCHEMY-ERROR batch={retry_label}] {err_msg}")
+                # Retry with smaller batch if not the last attempt
+                if retry_label == "100":
+                    time.sleep(1)
+                    continue
+                return {"available": False, "reason": f"Alchemy: {err_msg}"}
+
+            transfers = body.get("result", {}).get("transfers", [])
+            logger.warning(f"[MINT-ALCHEMY-OK batch={retry_label}] transfers={len(transfers)}")
+            break  # success — exit retry loop
+        except http_requests.exceptions.Timeout:
+            logger.warning(f"[MINT-ALCHEMY-TIMEOUT batch={retry_label}]")
+            if retry_label == "100":
+                continue
+            return {"available": False, "reason": "Alchemy timeout after retries"}
+        except Exception as e:
+            logger.warning(f"[MINT-ALCHEMY-EXCEPTION batch={retry_label}] {type(e).__name__}: {e}")
+            if retry_label == "100":
+                continue
+            return {"available": False, "reason": f"{type(e).__name__}: {str(e)[:80]}"}
+    else:
+        # Both retries failed
+        return {"available": False, "reason": "All Alchemy retries exhausted"}
+
     try:
-        # alchemy_getAssetTransfers: from=0x0 + contractAddress = all mints
-        # category erc20 limits to ERC20 Transfer events
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "alchemy_getAssetTransfers",
-            "params": [{
-                "fromAddress": "0x0000000000000000000000000000000000000000",
-                "contractAddresses": [address],
-                "category": ["erc20"],
-                "withMetadata": True,
-                "maxCount": "0x3e8",  # 1000, max allowed per call
-                "order": "desc",  # newest first
-            }],
-        }
-        r = http_requests.post(url, json=payload, timeout=25)
-        body = r.json()
-
-        if "error" in body:
-            err_msg = str(body.get("error", {}).get("message", ""))[:100]
-            logger.warning(f"[MINT-ALCHEMY-ERROR] {err_msg}")
-            return {"available": False, "reason": f"Alchemy: {err_msg}"}
-
-        transfers = body.get("result", {}).get("transfers", [])
-        logger.warning(f"[MINT-ALCHEMY-RAW] transfers={len(transfers)}")
 
         if not transfers:
             return {
