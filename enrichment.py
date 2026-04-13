@@ -316,81 +316,84 @@ def _fetch_dexscreener(address: str) -> dict:
 
 
 def _fetch_mint_history(chain_id: int, address: str, decimals: int, api_key: str) -> dict:
-    """Fetch all mint events by querying Transfer logs where from = 0x0.
+    """Fetch mint events via tokentx API, filtering for from=0x0 in code.
 
-    Uses Etherscan V2 getLogs API (more reliable than tokentx for this query).
-    Transfer event signature: Transfer(address indexed from, address indexed to, uint256 value)
-    Topic0 = keccak256("Transfer(address,address,uint256)")
-    Topic1 = from address (left-padded to 32 bytes)
+    Etherscan V2 getLogs + topic filter doesn't reliably match, so we pull
+    the tx list directly and filter. Limited to 10,000 most recent transfers
+    which is enough to catch recent minting activity for any active token.
     """
-    TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-    ZERO_TOPIC = "0x0000000000000000000000000000000000000000000000000000000000000000"
-
+    ZERO = "0x0000000000000000000000000000000000000000"
     try:
-        # getLogs: Transfer events from contract where topic1 (from) = 0x0
-        # Etherscan V2 limits to 1000 logs per call, start from latest block
+        import logging as _lg
+        logger = _lg.getLogger("enrichment")
+
+        # tokentx returns recent ERC20 transfers for this contract.
+        # offset=10000 is max Etherscan allows per page
         params = {
             "chainid": chain_id,
-            "module": "logs",
-            "action": "getLogs",
-            "address": address,
-            "topic0": TRANSFER_TOPIC,
-            "topic0_1_opr": "and",
-            "topic1": ZERO_TOPIC,
+            "module": "account",
+            "action": "tokentx",
+            "contractaddress": address,
             "page": 1,
-            "offset": 1000,
+            "offset": 10000,
+            "sort": "desc",  # newest first - we want recent mint activity
             "apikey": api_key,
         }
-        r = http_requests.get(ETHERSCAN_V2, params=params, timeout=20)
+        r = http_requests.get(ETHERSCAN_V2, params=params, timeout=25)
         body = r.json()
 
-        if body.get("status") != "1":
-            msg = body.get("message", "")
-            # "No records found" is normal for non-minting contracts
-            if "No records" in msg or "No transactions" in msg:
-                return {"available": True, "mint_count": 0, "note": "No mint events in logs"}
-            return {
-                "available": False,
-                "reason": f"getLogs: {msg[:80]} / result: {str(body.get('result',''))[:80]}",
-            }
+        logger.warning(
+            f"[MINT-TX-RAW] status={body.get('status')} "
+            f"message={str(body.get('message',''))[:60]} "
+            f"tx_count={len(body.get('result', [])) if isinstance(body.get('result'), list) else 'N/A'}"
+        )
 
-        logs = body.get("result", [])
-        if not isinstance(logs, list) or not logs:
-            return {"available": True, "mint_count": 0, "note": "No mint events"}
+        if body.get("status") != "1":
+            msg = str(body.get("message", ""))
+            if "No transactions" in msg or "No records" in msg:
+                return {"available": True, "mint_count": 0, "note": "No transfers found"}
+            return {"available": False, "reason": f"API: {msg[:80]}"}
+
+        txs = body.get("result", [])
+        if not isinstance(txs, list) or not txs:
+            return {"available": True, "mint_count": 0, "note": "Empty result"}
+
+        # Filter for mints: from = 0x0
+        mints = [tx for tx in txs if tx.get("from", "").lower() == ZERO]
+        logger.warning(f"[MINT-FILTER] total_tx={len(txs)} mints={len(mints)}")
+
+        if not mints:
+            return {
+                "available": True,
+                "mint_count": 0,
+                "note": f"No mints in {len(txs)} recent transfers (may have older mints beyond this window)",
+                "transfers_scanned": len(txs),
+            }
 
         divisor = 10 ** decimals
         amounts = []
         recipients = {}
         timestamps = []
 
-        for log in logs:
+        for tx in mints:
             try:
-                # Transfer event: value is in `data`, to address is in topics[2]
-                data_hex = log.get("data", "0x0")
-                amount = int(data_hex, 16) / divisor
+                amount = int(tx.get("value", "0")) / divisor
                 amounts.append(amount)
-
-                topics = log.get("topics", [])
-                if len(topics) >= 3:
-                    # topics[2] = to address (last 40 hex chars)
-                    to_addr = "0x" + topics[2][-40:].lower()
-                    recipients[to_addr] = recipients.get(to_addr, 0) + amount
-
-                # timeStamp is hex in getLogs
-                ts_hex = log.get("timeStamp", "0x0")
-                ts = int(ts_hex, 16) if ts_hex.startswith("0x") else int(ts_hex)
+                ts = int(tx.get("timeStamp", "0"))
                 timestamps.append(ts)
-            except (ValueError, TypeError, IndexError):
+                to_addr = tx.get("to", "").lower()
+                recipients[to_addr] = recipients.get(to_addr, 0) + amount
+            except (ValueError, TypeError):
                 continue
 
         if not amounts:
-            return {"available": True, "mint_count": 0, "note": "Logs found but couldn't parse"}
+            return {"available": True, "mint_count": 0, "note": "Parse failure"}
 
         total_minted = sum(amounts)
         largest = max(amounts)
-        last_ts = max(timestamps) if timestamps else 0
+        last_ts = max(timestamps)
         now_ts = int(time.time())
-        days_ago = (now_ts - last_ts) / 86400 if last_ts else 0
+        days_ago = (now_ts - last_ts) / 86400
 
         cutoff_30d = now_ts - (30 * 86400)
         recent_30d = sum(
@@ -400,13 +403,14 @@ def _fetch_mint_history(chain_id: int, address: str, decimals: int, api_key: str
 
         top_recipients = sorted(recipients.items(), key=lambda x: -x[1])[:3]
         top_recipients_fmt = [
-            {"address": addr, "amount": round(amt, 4), "pct": round(amt / total_minted * 100, 2)}
+            {"address": addr, "amount": round(amt, 4),
+             "pct": round(amt / total_minted * 100, 2)}
             for addr, amt in top_recipients
         ]
 
         return {
             "available": True,
-            "mint_count": len(amounts),
+            "mint_count": len(mints),
             "total_minted": round(total_minted, 4),
             "largest_single_mint": round(largest, 4),
             "last_mint_timestamp": last_ts,
@@ -414,7 +418,12 @@ def _fetch_mint_history(chain_id: int, address: str, decimals: int, api_key: str
             "recent_30d_minted": round(recent_30d, 4),
             "recent_30d_pct": round(recent_30d_pct, 2),
             "top_recipients": top_recipients_fmt,
-            "truncated": len(logs) >= 1000,
+            "transfers_scanned": len(txs),
+            "window_note": (
+                f"Scanned {len(txs)} most recent transfers. "
+                "Older mint history beyond this window not included."
+                if len(txs) >= 10000 else ""
+            ),
         }
     except Exception as e:
         return {"available": False, "reason": f"{type(e).__name__}: {str(e)[:100]}"}
