@@ -12,6 +12,7 @@ Usage:
 """
 
 import json
+import os
 import time
 import concurrent.futures
 import requests as http_requests
@@ -19,6 +20,21 @@ from typing import Optional
 
 ETHERSCAN_V2 = "https://api.etherscan.io/v2/api"
 DEXSCREENER = "https://api.dexscreener.com/latest/dex/tokens/"
+
+# Alchemy network subdomains per chain_id (for getAssetTransfers API).
+# Only networks with Alchemy support listed; others will skip mint_history.
+ALCHEMY_NETWORKS = {
+    1:        "eth-mainnet",
+    11155111: "eth-sepolia",
+    137:      "polygon-mainnet",
+    10:       "opt-mainnet",
+    42161:    "arb-mainnet",
+    8453:     "base-mainnet",
+    56:       "bnb-mainnet",
+    43114:    "avax-mainnet",
+    324:      "zksync-mainnet",
+    59144:    "linea-mainnet",
+}
 
 # Etherscan free tier: 5 calls/sec. Stay under by using 3 parallel workers
 # and retrying once on rate limit failures.
@@ -316,108 +332,102 @@ def _fetch_dexscreener(address: str) -> dict:
 
 
 def _fetch_mint_history(chain_id: int, address: str, decimals: int, api_key: str) -> dict:
-    """Fetch mint events via tokentx API, filtering for from=0x0 in code.
+    """Fetch mint events via Alchemy getAssetTransfers API.
 
-    Etherscan V2 getLogs + topic filter doesn't reliably match, so we pull
-    the tx list directly and filter. Limited to 10,000 most recent transfers
-    which is enough to catch recent minting activity for any active token.
+    Alchemy reliably indexes ERC20 Transfer events including from=0x0 (mints),
+    unlike Etherscan's logs API which has incomplete coverage.
+
+    Requires ALCHEMY_API_KEY env var. Falls back gracefully if not set or
+    if network isn't supported by Alchemy.
     """
-    ZERO = "0x0000000000000000000000000000000000000000"
-    try:
-        import logging as _lg
-        logger = _lg.getLogger("enrichment")
+    import logging as _lg
+    logger = _lg.getLogger("enrichment")
 
-        # tokentx returns recent ERC20 transfers for this contract.
-        # offset=10000 is max Etherscan allows per page
-        params = {
-            "chainid": chain_id,
-            "module": "account",
-            "action": "tokentx",
-            "contractaddress": address,
-            "page": 1,
-            "offset": 10000,
-            "sort": "desc",  # newest first - we want recent mint activity
-            "apikey": api_key,
+    alchemy_key = os.environ.get("ALCHEMY_API_KEY", "").strip()
+    if not alchemy_key:
+        return {"available": False, "reason": "ALCHEMY_API_KEY not configured"}
+
+    network = ALCHEMY_NETWORKS.get(chain_id)
+    if not network:
+        return {"available": False, "reason": f"Alchemy does not support chain_id={chain_id}"}
+
+    url = f"https://{network}.g.alchemy.com/v2/{alchemy_key}"
+
+    try:
+        # alchemy_getAssetTransfers: from=0x0 + contractAddress = all mints
+        # category erc20 limits to ERC20 Transfer events
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "alchemy_getAssetTransfers",
+            "params": [{
+                "fromAddress": "0x0000000000000000000000000000000000000000",
+                "contractAddresses": [address],
+                "category": ["erc20"],
+                "withMetadata": True,
+                "maxCount": "0x3e8",  # 1000, max allowed per call
+                "order": "desc",  # newest first
+            }],
         }
-        r = http_requests.get(ETHERSCAN_V2, params=params, timeout=25)
+        r = http_requests.post(url, json=payload, timeout=25)
         body = r.json()
 
-        logger.warning(
-            f"[MINT-TX-RAW] status={body.get('status')} "
-            f"message={str(body.get('message',''))[:60]} "
-            f"tx_count={len(body.get('result', [])) if isinstance(body.get('result'), list) else 'N/A'}"
-        )
+        if "error" in body:
+            err_msg = str(body.get("error", {}).get("message", ""))[:100]
+            logger.warning(f"[MINT-ALCHEMY-ERROR] {err_msg}")
+            return {"available": False, "reason": f"Alchemy: {err_msg}"}
 
-        if body.get("status") != "1":
-            msg = str(body.get("message", ""))
-            if "No transactions" in msg or "No records" in msg:
-                return {"available": True, "mint_count": 0, "note": "No transfers found"}
-            return {"available": False, "reason": f"API: {msg[:80]}"}
+        transfers = body.get("result", {}).get("transfers", [])
+        logger.warning(f"[MINT-ALCHEMY-RAW] transfers={len(transfers)}")
 
-        txs = body.get("result", [])
-        if not isinstance(txs, list) or not txs:
-            return {"available": True, "mint_count": 0, "note": "Empty result"}
-
-        # Filter for mints: from = 0x0
-        mints = [tx for tx in txs if tx.get("from", "").lower() == ZERO]
-        logger.warning(f"[MINT-FILTER] total_tx={len(txs)} mints={len(mints)}")
-
-        if not mints:
-            # Check if this is a high-volume token where 10000 tx covers a tiny window
-            try:
-                oldest_ts = int(txs[-1].get("timeStamp", "0"))
-                newest_ts = int(txs[0].get("timeStamp", "0"))
-                window_seconds = newest_ts - oldest_ts
-                window_desc = (
-                    f"{window_seconds // 60} minutes" if window_seconds < 3600
-                    else f"{window_seconds // 3600} hours" if window_seconds < 86400
-                    else f"{window_seconds // 86400} days"
-                )
-            except Exception:
-                window_desc = "unknown window"
-
+        if not transfers:
             return {
                 "available": True,
                 "mint_count": 0,
-                "transfers_scanned": len(txs),
-                "scan_window": window_desc,
-                "note": (
-                    f"No mints in last {len(txs)} transfers ({window_desc}). "
-                    "For high-volume tokens like USDT/USDC, this window may be "
-                    "too small to rule out historical minting. For low-volume "
-                    "tokens, this likely represents complete mint history."
-                ),
+                "note": "No mint events found via Alchemy (token may have initial-supply-only distribution)",
             }
 
-        divisor = 10 ** decimals
+        # Parse transfers. Alchemy returns value as decimal number (already divided by decimals)
+        # but we'll use rawContract.value (hex) and divide ourselves for precision.
         amounts = []
         recipients = {}
         timestamps = []
 
-        for tx in mints:
+        divisor = 10 ** decimals
+        for tx in transfers:
             try:
-                amount = int(tx.get("value", "0")) / divisor
+                raw = tx.get("rawContract", {})
+                raw_value = raw.get("value", "0x0")
+                amount = int(raw_value, 16) / divisor
                 amounts.append(amount)
-                ts = int(tx.get("timeStamp", "0"))
-                timestamps.append(ts)
-                to_addr = tx.get("to", "").lower()
-                recipients[to_addr] = recipients.get(to_addr, 0) + amount
-            except (ValueError, TypeError):
+
+                to_addr = (tx.get("to") or "").lower()
+                if to_addr:
+                    recipients[to_addr] = recipients.get(to_addr, 0) + amount
+
+                # metadata.blockTimestamp is ISO string e.g. "2024-12-01T10:30:00.000Z"
+                ts_str = (tx.get("metadata") or {}).get("blockTimestamp", "")
+                if ts_str:
+                    # Parse ISO → unix ts
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    timestamps.append(int(dt.timestamp()))
+            except (ValueError, TypeError, KeyError):
                 continue
 
         if not amounts:
-            return {"available": True, "mint_count": 0, "note": "Parse failure"}
+            return {"available": True, "mint_count": 0, "note": "Transfers found but parse failed"}
 
         total_minted = sum(amounts)
         largest = max(amounts)
-        last_ts = max(timestamps)
+        last_ts = max(timestamps) if timestamps else 0
         now_ts = int(time.time())
-        days_ago = (now_ts - last_ts) / 86400
+        days_ago = (now_ts - last_ts) / 86400 if last_ts else 0
 
         cutoff_30d = now_ts - (30 * 86400)
         recent_30d = sum(
             amt for amt, ts in zip(amounts, timestamps) if ts >= cutoff_30d
-        )
+        ) if timestamps else 0
         recent_30d_pct = (recent_30d / total_minted * 100) if total_minted > 0 else 0
 
         top_recipients = sorted(recipients.items(), key=lambda x: -x[1])[:3]
@@ -429,7 +439,7 @@ def _fetch_mint_history(chain_id: int, address: str, decimals: int, api_key: str
 
         return {
             "available": True,
-            "mint_count": len(mints),
+            "mint_count": len(amounts),
             "total_minted": round(total_minted, 4),
             "largest_single_mint": round(largest, 4),
             "last_mint_timestamp": last_ts,
@@ -437,16 +447,10 @@ def _fetch_mint_history(chain_id: int, address: str, decimals: int, api_key: str
             "recent_30d_minted": round(recent_30d, 4),
             "recent_30d_pct": round(recent_30d_pct, 2),
             "top_recipients": top_recipients_fmt,
-            "transfers_scanned": len(txs),
-            "window_note": (
-                f"Scanned {len(txs)} most recent transfers. "
-                "Older mint history beyond this window not included."
-                if len(txs) >= 10000 else ""
-            ),
+            "truncated": len(transfers) >= 1000,
         }
     except Exception as e:
         return {"available": False, "reason": f"{type(e).__name__}: {str(e)[:100]}"}
-
 
 def enrich_contract(address: str, chain_id: int, etherscan_key: str) -> dict:
     """

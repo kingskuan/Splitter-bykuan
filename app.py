@@ -911,11 +911,14 @@ def debug():
         files_in_dir = sorted(_os.listdir("/app"))
     except Exception:
         pass
+    alchemy_key = _os.environ.get("ALCHEMY_API_KEY", "")
     return jsonify({
         "enrichment_enabled": ENRICHMENT_ENABLED,
         "enrichment_import_error": ENRICHMENT_IMPORT_ERROR,
         "etherscan_key_set": bool(ETHERSCAN_API_KEY),
         "etherscan_key_length": len(ETHERSCAN_API_KEY) if ETHERSCAN_API_KEY else 0,
+        "alchemy_key_set": bool(alchemy_key),
+        "alchemy_key_length": len(alchemy_key),
         "api_key_set": bool(API_KEY),
         "files_in_app_dir": files_in_dir,
         "supported_networks": list(NETWORK_CHAIN_IDS.keys()),
