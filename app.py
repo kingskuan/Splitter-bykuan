@@ -189,6 +189,26 @@ def resolve_solc_binary(version: str) -> str:
     return default_path
 
 
+import re
+
+# Strict pragma pattern: matches `pragma solidity =0.5.12;` or `pragma solidity 0.5.12;`
+# We relax to `pragma solidity ^X.Y.Z;` to allow our nearest-patch solc to compile.
+_STRICT_PRAGMA_RE = re.compile(
+    r'(pragma\s+solidity\s+)(=\s*|(?=\d))(\d+\.\d+\.\d+)\s*;',
+    re.IGNORECASE
+)
+
+
+def _relax_pragma(source: str) -> str:
+    """Convert `pragma solidity =0.5.12;` → `pragma solidity ^0.5.12;` so that
+    our nearest-patch pre-installed solc (e.g. 0.5.17) can compile it.
+
+    Only touches single-version strict pragmas. Leaves complex range pragmas
+    (>=0.5.0 <0.6.0) untouched — those already accept patch variance.
+    """
+    return _STRICT_PRAGMA_RE.sub(r'\1^\3;', source)
+
+
 def prepare_source_files(work_dir: str, source_code: str, contract_name: str):
     """Write source code to temp directory, handling single and multi-file formats.
 
@@ -212,12 +232,20 @@ def prepare_source_files(work_dir: str, source_code: str, contract_name: str):
                 sources = sources["sources"]
             main_file = None
             written_files = []
+            pragma_relaxed = 0
             for filename, content in sources.items():
                 # Sanitize: filenames may start with / or have .. — normalize
                 safe_name = filename.lstrip("/")
                 filepath = os.path.join(work_dir, safe_name)
                 os.makedirs(os.path.dirname(filepath) or work_dir, exist_ok=True)
                 code = content if isinstance(content, str) else content.get("content", "")
+
+                # Relax strict pragmas so nearest-patch solc can compile
+                relaxed = _relax_pragma(code)
+                if relaxed != code:
+                    pragma_relaxed += 1
+                    code = relaxed
+
                 with open(filepath, "w") as f:
                     f.write(code)
                 written_files.append(safe_name)
@@ -236,12 +264,14 @@ def prepare_source_files(work_dir: str, source_code: str, contract_name: str):
                     main_file = filepath
 
             app.logger.warning(f"[PREPARE] wrote {len(written_files)} files, "
+                               f"pragmas_relaxed={pragma_relaxed}, "
                                f"remappings={sorted(remappings)[:5]}...")
             return (main_file or work_dir, sorted(remappings))
     except (json.JSONDecodeError, AttributeError):
         pass
 
-    # Single file
+    # Single file — also relax pragma
+    source_code = _relax_pragma(source_code)
     filename = f"{contract_name or 'Contract'}.sol"
     filepath = os.path.join(work_dir, filename)
     with open(filepath, "w") as f:
