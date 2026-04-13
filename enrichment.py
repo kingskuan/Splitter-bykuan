@@ -363,11 +363,30 @@ def _fetch_mint_history(chain_id: int, address: str, decimals: int, api_key: str
         logger.warning(f"[MINT-FILTER] total_tx={len(txs)} mints={len(mints)}")
 
         if not mints:
+            # Check if this is a high-volume token where 10000 tx covers a tiny window
+            try:
+                oldest_ts = int(txs[-1].get("timeStamp", "0"))
+                newest_ts = int(txs[0].get("timeStamp", "0"))
+                window_seconds = newest_ts - oldest_ts
+                window_desc = (
+                    f"{window_seconds // 60} minutes" if window_seconds < 3600
+                    else f"{window_seconds // 3600} hours" if window_seconds < 86400
+                    else f"{window_seconds // 86400} days"
+                )
+            except Exception:
+                window_desc = "unknown window"
+
             return {
                 "available": True,
                 "mint_count": 0,
-                "note": f"No mints in {len(txs)} recent transfers (may have older mints beyond this window)",
                 "transfers_scanned": len(txs),
+                "scan_window": window_desc,
+                "note": (
+                    f"No mints in last {len(txs)} transfers ({window_desc}). "
+                    "For high-volume tokens like USDT/USDC, this window may be "
+                    "too small to rule out historical minting. For low-volume "
+                    "tokens, this likely represents complete mint history."
+                ),
             }
 
         divisor = 10 ** decimals
