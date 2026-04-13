@@ -255,6 +255,9 @@ def _analyze_abi(abi: list) -> dict:
     has_pause = False
     roles = set()
 
+    # Function names that create new tokens (mint variants across different ERC20 implementations)
+    MINT_FUNC_NAMES = {"mint", "_mint", "issue", "_issue", "createTokens", "generateTokens"}
+
     for item in abi:
         if item.get("type") != "function":
             continue
@@ -264,8 +267,10 @@ def _analyze_abi(abi: list) -> dict:
         if name in DANGEROUS_FUNCS:
             dangerous.append(name)
 
-        if name in ("mint", "_mint"):
+        if name in MINT_FUNC_NAMES:
             has_mint = True
+            if name not in dangerous:
+                dangerous.append(name)
         # burn(address, uint256) = can burn others
         if name in ("burn", "burnFrom") and len(inputs) >= 2 and inputs[0].get("type") == "address":
             has_burn_other = True
@@ -467,9 +472,15 @@ def enrich_contract(address: str, chain_id: int, etherscan_key: str) -> dict:
     # Mint history (needs decimals, so runs after parallel batch)
     # Only fetch if contract has mint capability (saves API call for non-mintable tokens)
     mint_analysis = _analyze_abi(abi)  # quick re-check inline
+    import logging as _logging
+    _log = _logging.getLogger("enrichment")
     if mint_analysis.get("has_mint"):
-        result["mint_history"] = _fetch_mint_history(chain_id, address, decimals, etherscan_key)
+        _log.warning(f"[MINT-HISTORY-START] fetching for {address} decimals={decimals}")
+        mh = _fetch_mint_history(chain_id, address, decimals, etherscan_key)
+        _log.warning(f"[MINT-HISTORY-DONE] available={mh.get('available')} count={mh.get('mint_count')} reason={mh.get('reason')}")
+        result["mint_history"] = mh
     else:
+        _log.warning(f"[MINT-HISTORY-SKIP] no mint() function in ABI")
         result["mint_history"] = {
             "available": True, "mint_count": 0,
             "note": "Contract has no mint() function",
