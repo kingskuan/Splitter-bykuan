@@ -383,6 +383,112 @@ def run_slither(target: str, work_dir: str, solc_path: str, remappings=None) -> 
         raise RuntimeError(f"Slither output not valid JSON: {output[:300]}... stderr: {stderr[:300]}")
 
 
+# ── Semgrep Integration ──────────────────────────────────────────────
+
+# Path to SlithKing custom rules (copied into container by Dockerfile)
+_SEMGREP_RULES_PATH = "/app/slithking-rules.yaml"
+
+
+def run_semgrep(work_dir: str) -> dict:
+    """Run Semgrep with SlithKing custom rules on the source files.
+
+    Returns a dict with:
+      - findings: list of {rule_id, severity, message, file, line, tag}
+      - summary: {error: N, warning: N, info: N}
+      - duration_ms: int
+    """
+    if not os.path.exists(_SEMGREP_RULES_PATH):
+        app.logger.warning("[SEMGREP-SKIP] rules file not found")
+        return {"findings": [], "summary": {}, "error": "rules file missing"}
+
+    start = time.time()
+    cmd = [
+        "semgrep",
+        "--config", _SEMGREP_RULES_PATH,
+        "--json",
+        "--no-git-ignore",
+        "--metrics", "off",
+        "--disable-version-check",
+        "--timeout", "30",
+        work_dir,
+    ]
+
+    # Prevent Semgrep from making any network calls (Railway has egress limits)
+    env = os.environ.copy()
+    env["SEMGREP_SEND_METRICS"] = "off"
+    env["SEMGREP_VERSION_CHECK"] = "0"
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        duration_ms = int((time.time() - start) * 1000)
+
+        output = result.stdout.strip()
+        app.logger.warning(f"[SEMGREP-EXIT] code={result.returncode} stdout={len(output)}b duration={duration_ms}ms")
+
+        if not output:
+            return {"findings": [], "summary": {}, "duration_ms": duration_ms}
+
+        raw = json.loads(output)
+        results = raw.get("results", [])
+
+        # Parse into clean format
+        findings = []
+        severity_count = {"error": 0, "warning": 0, "info": 0}
+
+        for r in results:
+            severity = r.get("extra", {}).get("severity", "INFO").lower()
+            metadata = r.get("extra", {}).get("metadata", {})
+            tag = metadata.get("slithking-tag", "")
+            category = metadata.get("category", "")
+
+            finding = {
+                "rule_id": r.get("check_id", "").replace("slithking-rules.", ""),
+                "severity": severity,
+                "message": r.get("extra", {}).get("message", "").strip(),
+                "file": os.path.basename(r.get("path", "")),
+                "line_start": r.get("start", {}).get("line", 0),
+                "line_end": r.get("end", {}).get("line", 0),
+                "code": r.get("extra", {}).get("lines", "").strip()[:200],
+                "tag": tag,
+                "category": category,
+            }
+            findings.append(finding)
+            severity_count[severity] = severity_count.get(severity, 0) + 1
+
+        # Deduplicate by (rule_id, file, line_start)
+        seen = set()
+        deduped = []
+        for f in findings:
+            key = (f["rule_id"], f["file"], f["line_start"])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(f)
+
+        app.logger.warning(f"[SEMGREP-OK] findings={len(deduped)} (raw={len(findings)}) severity={severity_count}")
+
+        return {
+            "findings": deduped,
+            "summary": severity_count,
+            "duration_ms": duration_ms,
+        }
+
+    except subprocess.TimeoutExpired:
+        app.logger.warning("[SEMGREP-TIMEOUT]")
+        return {"findings": [], "summary": {}, "error": "timeout"}
+    except json.JSONDecodeError as e:
+        app.logger.warning(f"[SEMGREP-JSON-ERROR] {e}")
+        return {"findings": [], "summary": {}, "error": f"json parse: {e}"}
+    except Exception as e:
+        app.logger.warning(f"[SEMGREP-ERROR] {type(e).__name__}: {e}")
+        return {"findings": [], "summary": {}, "error": str(e)[:100]}
+
+
 def fetch_external_risks(address: str, network: str) -> dict:
     """Fetch off-chain & live-state risks via GoPlus Security API (free, no key).
 
@@ -1020,6 +1126,9 @@ def analyze():
         # Step 4: Run Slither with explicit solc binary
         slither_output = run_slither(target, work_dir, solc_path, remappings)
 
+        # Step 4b: Run Semgrep with SlithKing custom rules (parallel-safe, independent of Slither)
+        semgrep_results = run_semgrep(work_dir)
+
         # Step 5: Categorize findings
         findings = categorize_findings(slither_output)
 
@@ -1084,6 +1193,7 @@ def analyze():
             "max_supply_analysis": max_supply_analysis,
             "owner_analysis": owner_analysis,
             "external_risks": external_risks,
+            "semgrep": semgrep_results,
             "enriched": enriched,
             "summary": summary,
             "duration_ms": duration_ms,

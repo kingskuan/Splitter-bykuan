@@ -1,0 +1,348 @@
+rules:
+
+  # ═══════════════════════════════════════════════════════════════════
+  # SlithKing Semgrep Rules — ERC20 Token Risk Detection
+  # These rules catch patterns Slither misses, specifically designed
+  # for on-demand smart contract risk assessment.
+  # ═══════════════════════════════════════════════════════════════════
+
+  # ── MINT / SUPPLY MANIPULATION ──────────────────────────────────
+
+  - id: slithking-hidden-mint
+    patterns:
+      - pattern: |
+          function $FUNC(...) {
+            ...
+            $SUPPLY_VAR = $EXPR;
+            ...
+          }
+      - metavariable-regex:
+          metavariable: $SUPPLY_VAR
+          regex: (?i).*total.?supply.*
+      - pattern-not: |
+          function $FUNC(...) internal { ... }
+    message: >
+      Function '$FUNC' modifies supply variable '$SUPPLY_VAR' directly.
+      This is a mint/burn capability regardless of function name.
+      Check access control — if restricted to single admin, this is a rug pull vector.
+    severity: ERROR
+    languages: [solidity]
+    metadata:
+      category: supply-manipulation
+      slithking-tag: HIDDEN_MINT
+      confidence: HIGH
+
+  - id: slithking-uncapped-mint
+    patterns:
+      - pattern: |
+          function $FUNC(...) {
+            ...
+            _mint($TO, $AMT);
+            ...
+          }
+      - pattern-not: |
+          function $FUNC(...) {
+            ...
+            require(totalSupply() + $AMT <= ...);
+            ...
+          }
+      - pattern-not: |
+          function $FUNC(...) internal { ... }
+    message: >
+      Function '$FUNC' calls _mint() without a supply cap check.
+      No require() limiting totalSupply found before mint.
+    severity: ERROR
+    languages: [solidity]
+    metadata:
+      category: supply-manipulation
+      slithking-tag: UNCAPPED_MINT_CALL
+      confidence: MEDIUM
+
+  # ── ACCESS CONTROL / HIDDEN ADMIN ───────────────────────────────
+
+  - id: slithking-custom-modifier-no-getter
+    pattern: |
+      modifier $MOD() {
+        require(msg.sender == $VAR, ...);
+        _;
+      }
+    message: >
+      Custom access modifier '$MOD' restricts to '$VAR'. Check if this
+      variable has a public getter — if not, admin identity is hidden.
+    severity: WARNING
+    languages: [solidity]
+    metadata:
+      category: hidden-admin
+      slithking-tag: CUSTOM_ACCESS_MODIFIER
+      confidence: HIGH
+
+  - id: slithking-onlyrole-pattern
+    pattern: |
+      modifier $MOD() {
+        require(msg.sender == $ROLE);
+        _;
+      }
+    message: >
+      Modifier '$MOD' restricts access to '$ROLE' without error message.
+      This often indicates a custom admin role.
+    severity: WARNING
+    languages: [solidity]
+    metadata:
+      category: hidden-admin
+      slithking-tag: CUSTOM_ACCESS_MODIFIER
+      confidence: HIGH
+
+  - id: slithking-role-mapping-admin
+    pattern: |
+      mapping(address => $TYPE) ... $ROLES;
+      ...
+      modifier $MOD(...) {
+        require($ROLES[...], ...);
+        _;
+      }
+    message: >
+      Mapping-based access control '$ROLES' with modifier '$MOD'.
+      Admin addresses are stored in a mapping — harder to enumerate than
+      a single owner() getter. Check who has been granted roles.
+    severity: WARNING
+    languages: [solidity]
+    metadata:
+      category: hidden-admin
+      slithking-tag: MAPPING_BASED_ADMIN
+      confidence: MEDIUM
+
+  # ── BLACKLIST / FREEZE ──────────────────────────────────────────
+
+  - id: slithking-blacklist-function
+    pattern: |
+      function $FUNC(address $ADDR, ...) ... {
+        ...
+        $BLACKLIST[$ADDR] = $VAL;
+        ...
+      }
+    message: >
+      Function '$FUNC' can modify a blacklist mapping for arbitrary addresses.
+      This enables censorship of specific users.
+    severity: ERROR
+    languages: [solidity]
+    metadata:
+      category: censorship
+      slithking-tag: BLACKLIST_FUNCTION
+      confidence: HIGH
+
+  - id: slithking-transfer-blacklist-check
+    pattern: |
+      function transfer(...) ... {
+        ...
+        require(!$BLACKLIST[...], ...);
+        ...
+      }
+    message: >
+      Transfer function checks a blacklist mapping before executing.
+      Blacklisted addresses cannot send tokens.
+    severity: WARNING
+    languages: [solidity]
+    metadata:
+      category: censorship
+      slithking-tag: TRANSFER_BLOCKED_BY_BLACKLIST
+      confidence: HIGH
+
+  # ── PAUSE MECHANISM ─────────────────────────────────────────────
+
+  - id: slithking-pausable-transfer
+    pattern: |
+      function transfer(...) ... {
+        ...
+        require(!paused, ...);
+        ...
+      }
+    message: >
+      Transfer function is gated by a 'paused' flag. When paused=true,
+      all transfers are blocked globally.
+    severity: WARNING
+    languages: [solidity]
+    metadata:
+      category: censorship
+      slithking-tag: PAUSABLE_TRANSFER
+      confidence: HIGH
+
+  - id: slithking-whennotpaused-modifier
+    pattern: |
+      function transfer(...) ... whenNotPaused ... { ... }
+    message: >
+      Transfer uses whenNotPaused modifier — global pause capability exists.
+    severity: WARNING
+    languages: [solidity]
+    metadata:
+      category: censorship
+      slithking-tag: PAUSABLE_TRANSFER
+      confidence: HIGH
+
+  # ── EMERGENCY DRAIN / RUG PULL ──────────────────────────────────
+
+  - id: slithking-emergency-withdraw-eth
+    patterns:
+      - pattern: |
+          function $FUNC(...) ... {
+            ...
+            $ADDR.call{value: address(this).balance}(...);
+            ...
+          }
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: (?i).*(withdraw|rescue|emergency|drain|sweep|recover).*
+    message: >
+      Function '$FUNC' sends the contract's entire ETH balance to an address.
+      This is a potential rug pull vector if access-controlled by a single admin.
+    severity: ERROR
+    languages: [solidity]
+    metadata:
+      category: rug-pull
+      slithking-tag: EMERGENCY_DRAIN_ETH
+      confidence: HIGH
+
+  - id: slithking-emergency-withdraw-token
+    patterns:
+      - pattern: |
+          function $FUNC(...) ... {
+            ...
+            IERC20($TOKEN).transfer($TO, ...);
+            ...
+          }
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: (?i).*(withdraw|rescue|emergency|drain|sweep|recover).*
+    message: >
+      Function '$FUNC' can transfer arbitrary ERC20 tokens out of the contract.
+      Check if this can drain user deposits or LP tokens.
+    severity: ERROR
+    languages: [solidity]
+    metadata:
+      category: rug-pull
+      slithking-tag: EMERGENCY_DRAIN_TOKEN
+      confidence: MEDIUM
+
+  # ── FEE / TAX MANIPULATION ─────────────────────────────────────
+
+  - id: slithking-changeable-fee
+    patterns:
+      - pattern: |
+          function $FUNC(...) ... {
+            ...
+            $FEE = $VAL;
+            ...
+          }
+      - metavariable-regex:
+          metavariable: $FEE
+          regex: (?i).*(fee|tax|rate|commission|bps|basis).*
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: (?i).*(set|update|change|modify).*
+    message: >
+      Function '$FUNC' can modify fee variable '$FEE'. Trading fees can be
+      changed post-deployment — check for maximum cap and timelock.
+    severity: WARNING
+    languages: [solidity]
+    metadata:
+      category: fee-manipulation
+      slithking-tag: CHANGEABLE_FEE
+      confidence: MEDIUM
+
+  - id: slithking-high-fee-risk
+    pattern: |
+      require($FEE <= $MAX, ...);
+    message: >
+      Fee capped at '$MAX'. Verify this cap is reasonable (>10% is suspicious).
+    severity: INFO
+    languages: [solidity]
+    metadata:
+      category: fee-manipulation
+      slithking-tag: FEE_CAP_CHECK
+      confidence: LOW
+
+  # ── PROXY / UPGRADE RISK ────────────────────────────────────────
+
+  - id: slithking-selfdestruct
+    pattern: selfdestruct(...)
+    message: >
+      Contract contains selfdestruct. Owner can permanently destroy the contract
+      and sweep remaining ETH. Extremely dangerous if access-controlled.
+    severity: ERROR
+    languages: [solidity]
+    metadata:
+      category: rug-pull
+      slithking-tag: SELF_DESTRUCT
+      confidence: HIGH
+
+  - id: slithking-delegatecall-to-variable
+    pattern: |
+      $ADDR.delegatecall(...)
+    message: >
+      delegatecall to a variable address. If the target can be changed by admin,
+      this is an arbitrary code execution backdoor.
+    severity: ERROR
+    languages: [solidity]
+    metadata:
+      category: rug-pull
+      slithking-tag: DELEGATECALL_RISK
+      confidence: MEDIUM
+
+  # ── APPROVAL ABUSE ──────────────────────────────────────────────
+
+  - id: slithking-force-approve
+    patterns:
+      - pattern: |
+          function $FUNC(...) ... {
+            ...
+            _approve($OWNER, ..., $AMT);
+            ...
+          }
+      - pattern-not: |
+          function approve(...) ... { ... }
+      - pattern-not: |
+          function increaseAllowance(...) ... { ... }
+    message: >
+      Function '$FUNC' calls _approve() for arbitrary addresses outside of
+      standard approve/increaseAllowance. May enable approval hijacking.
+    severity: ERROR
+    languages: [solidity]
+    metadata:
+      category: approval-abuse
+      slithking-tag: FORCE_APPROVE
+      confidence: MEDIUM
+
+  # ── TRADING RESTRICTIONS ────────────────────────────────────────
+
+  - id: slithking-max-transaction-limit
+    patterns:
+      - pattern: |
+          function $FUNC(...) ... {
+            ...
+            require($AMT <= $MAX_TX, ...);
+            ...
+          }
+      - metavariable-regex:
+          metavariable: $MAX_TX
+          regex: (?i).*(maxTx|maxTransaction|_maxTx|maxTransactionAmount).*
+    message: >
+      Transaction amount is limited by '$MAX_TX'. This can be used to prevent
+      large sells (honeypot pattern) if set very low by admin.
+    severity: WARNING
+    languages: [solidity]
+    metadata:
+      category: trading-restriction
+      slithking-tag: MAX_TX_LIMIT
+      confidence: MEDIUM
+
+  - id: slithking-anti-bot-block-check
+    pattern: |
+      require(block.number > $LAUNCH + ..., ...)
+    message: >
+      Block number check relative to launch block. Anti-bot measure that
+      prevents early trading. Could also be used as a temporary honeypot.
+    severity: INFO
+    languages: [solidity]
+    metadata:
+      category: trading-restriction
+      slithking-tag: ANTI_BOT_BLOCK
+      confidence: LOW

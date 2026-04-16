@@ -36,6 +36,19 @@ RUN set -e && \
 # Copy all Python modules (app.py, enrichment.py, and any future modules)
 COPY *.py ./
 
+# Copy SlithKing custom Semgrep rules
+COPY slithking-rules.yaml ./
+
+# Install Semgrep (separate from requirements.txt — large package, ~100MB)
+# Then warm up: run once on dummy Solidity to pre-cache parser binary.
+# This prevents runtime downloads in Railway's restricted network.
+RUN pip install --no-cache-dir semgrep && \
+    semgrep --version && \
+    echo 'pragma solidity ^0.8.0; contract T { function x() public {} }' > /tmp/_warmup.sol && \
+    SEMGREP_SEND_METRICS=off semgrep --metrics off --disable-version-check \
+        --config /app/slithking-rules.yaml --json /tmp/_warmup.sol > /dev/null 2>&1 || true && \
+    rm -f /tmp/_warmup.sol
+
 ENV PORT=8080
 EXPOSE 8080
 
