@@ -1028,7 +1028,7 @@ def index():
     return jsonify({
         "service": "slither-analyzer",
         "status": "ok",
-        "endpoints": ["/health", "/analyze"],
+        "endpoints": ["/health", "/debug", "/semgrep", "/analyze"],
         "supported_networks": list(NETWORK_CHAIN_IDS.keys()),
     })
 
@@ -1059,6 +1059,50 @@ def debug():
         "files_in_app_dir": files_in_dir,
         "supported_networks": list(NETWORK_CHAIN_IDS.keys()),
     })
+
+
+@app.route("/semgrep", methods=["POST"])
+@require_api_key
+def semgrep_scan():
+    """Standalone Semgrep scan with SlithKing custom rules.
+
+    POST JSON: { "source_code": "...", "language": "solidity" }
+    Returns:   { "status": "ok", "findings": [...], "summary": {...}, "duration_ms": N }
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"status": "error", "message": "JSON body required"}), 400
+
+    source_code = data.get("source_code", "").strip()
+    if not source_code:
+        return jsonify({"status": "error", "message": "source_code is required"}), 400
+
+    language = data.get("language", "solidity").lower()
+    ext = ".sol" if language == "solidity" else f".{language}"
+
+    work_dir = tempfile.mkdtemp(prefix="semgrep_")
+    try:
+        # Write source to temp file
+        filepath = os.path.join(work_dir, f"Contract{ext}")
+        with open(filepath, "w") as f:
+            f.write(source_code)
+
+        # Run Semgrep
+        results = run_semgrep(work_dir)
+
+        return jsonify({
+            "status": "ok",
+            "findings": results.get("findings", []),
+            "summary": results.get("summary", {}),
+            "duration_ms": results.get("duration_ms", 0),
+        })
+
+    except Exception as e:
+        app.logger.exception("Semgrep scan failed")
+        return jsonify({"status": "error", "message": str(e)[:300]}), 500
+
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @app.route("/analyze", methods=["POST"])
