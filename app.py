@@ -189,7 +189,6 @@ def resolve_solc_binary(version: str) -> str:
     return default_path
 
 
-import re
 
 # Strict pragma pattern: matches `pragma solidity =0.5.12;` or `pragma solidity 0.5.12;`
 # We relax to `pragma solidity ^X.Y.Z;` to allow our nearest-patch solc to compile.
@@ -235,7 +234,9 @@ def prepare_source_files(work_dir: str, source_code: str, contract_name: str):
             pragma_relaxed = 0
             for filename, content in sources.items():
                 # Sanitize: filenames may start with / or have .. — normalize
-                safe_name = filename.lstrip("/")
+                safe_name = os.path.normpath(filename).lstrip(os.sep)
+                if ".." in safe_name.split(os.sep):
+                    continue
                 filepath = os.path.join(work_dir, safe_name)
                 os.makedirs(os.path.dirname(filepath) or work_dir, exist_ok=True)
                 code = content if isinstance(content, str) else content.get("content", "")
@@ -489,6 +490,13 @@ def run_semgrep(work_dir: str) -> dict:
         return {"findings": [], "summary": {}, "error": str(e)[:100]}
 
 
+def num_or_zero(v):
+    try:
+        return float(v) if v else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def fetch_external_risks(address: str, network: str) -> dict:
     """Fetch off-chain & live-state risks via GoPlus Security API (free, no key).
 
@@ -596,13 +604,6 @@ def fetch_external_risks(address: str, network: str) -> dict:
     except Exception as e:
         app.logger.warning(f"GoPlus fetch failed: {e}")
         return {"available": False, "reason": str(e)[:200]}
-
-
-def num_or_zero(v):
-    try:
-        return float(v) if v else 0.0
-    except (ValueError, TypeError):
-        return 0.0
 
 
 def extract_centralization_risks(source_code: str) -> dict:
@@ -1118,6 +1119,12 @@ def analyze():
     network = data.get("network", "mainnet").strip().lower()
     source_code = data.get("source_code", "").strip()
     contract_name = data.get("contract_name", "").strip()
+
+    if address and not re.match(r"^0x[a-fA-F0-9]{40}$", address):
+        return jsonify({
+            "status": "error",
+            "message": "Invalid contract address format. Expected 0x followed by 40 hex characters."
+        }), 400
 
     if not source_code and not address:
         return jsonify({
